@@ -1,0 +1,61 @@
+# ===== 敏感文件 =====
+.env
+*.key
+*.pem
+
+# ===== 数据库（用户数据）=====
+*.db
+*.db.bak
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+
+# ===== 前端编译产物 =====
+frontend/dist/
+backend/static/
+
+# ===== node_modules =====
+node_modules/
+
+# ===== 打包产物 =====
+dist-forensic-report/
+dist-司法鉴定系统/
+*.zip
+
+# ===== 用户上传文件（运行时生成）=====
+backend/uploads/
+uploads/
+
+# ===== 日志和报告（运行时生成）=====
+backend/logs/
+backend/reports/
+logs/
+reports/
+
+# ===== 模型文件（体积大）=====
+backend/models/
+
+# ===== OS 文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== 旧版中文脚本（已被英文版替代）=====
+启动.bat
+停止.bat
+启动鉴定系统.command
+关闭鉴定系统.command
+打包Windows版.sh
+
+# ===== venv =====
+.venv/
+venv/

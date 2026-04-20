@@ -1,0 +1,19 @@
+# 核心Web框架
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+sqlalchemy==2.0.35
+pydantic==2.9.0
+python-multipart==0.0.12
+aiofiles==24.1.0
+
+# Word文档生成
+python-docx==1.1.2
+
+# HTTP客户端（LLM API调用）
+httpx==0.28.1
+
+# OCR（调用硅基流动PaddleOCR-VL云端API）
+paddleocr==3.4.1
+
+# 图片处理（OCR裁切）
+Pillow==10.4.0
