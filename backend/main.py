@@ -98,6 +98,13 @@ from pathlib import Path
 
 FRONTEND_DIST = Path(__file__).parent / "static"
 
+# 静态文件（上传的材料）— 必须放在 SPA fallback 之前
+import os
+from app.config import settings
+UPLOAD_DIR = str(settings.UPLOAD_DIR)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 if FRONTEND_DIST.exists() and (FRONTEND_DIST / "index.html").exists():
     # 有前端静态文件时，托管前端SPA
     from starlette.responses import FileResponse
@@ -166,11 +173,3 @@ def get_logs(lines: int = 100, level: str = None):
         "total": len(recent),
         "log_file": log_file,
     }
-
-
-# 静态文件（上传的材料）— 使用 config.py 统一的 UPLOAD_DIR
-import os
-from app.config import settings
-UPLOAD_DIR = str(settings.UPLOAD_DIR)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")

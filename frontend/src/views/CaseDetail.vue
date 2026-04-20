@@ -1034,7 +1034,7 @@ function renderOcrMarkdown(md) {
   html = html.replace(/^---+$/gm, '<hr>')
   // 图片 ![alt](url) — 如果src以/uploads/开头，补上后端host
   html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
-    const fullSrc = src.startsWith('/uploads/') ? 'http://localhost:8000' + src : src
+    const fullSrc = src.startsWith('/uploads/') ? getBackendUrl(src) : src
     return `<img src="${fullSrc}" alt="${alt}" style="max-width:100%;border-radius:4px;margin:8px 0;">`
   })
   // 粗体 **text**
@@ -1123,13 +1123,13 @@ const materialImageUrl = computed(() => {
   // file_path 是绝对路径或相对路径，提取 /uploads/... 部分
   const idx = fp.indexOf('/uploads/')
   if (idx >= 0) {
-    return 'http://localhost:8000' + fp.substring(idx)
+    return getBackendUrl(fp.substring(idx))
   }
   // 如果 file_path 已经是 /uploads/ 开头
   if (fp.startsWith('/uploads/')) {
-    return 'http://localhost:8000' + fp
+    return getBackendUrl(fp)
   }
-  return 'http://localhost:8000/uploads/' + fp.split('/uploads/').pop()
+  return getBackendUrl('uploads/' + fp.split('/uploads/').pop())
 })
 
 // 复制图片引用
@@ -1889,15 +1889,25 @@ function viewOcrText(mat) {
   showOcrDialog.value = true
 }
 
+// 统一的图片URL生成函数
+function getBackendUrl(relativePath) {
+  if (!relativePath) return ''
+  const baseUrl = `${window.location.protocol}//${window.location.hostname}:8000`
+  return relativePath.startsWith('/') ? `${baseUrl}${relativePath}` : `${baseUrl}/${relativePath}`
+}
+
 // 获取材料图片URL
 function getMaterialImageUrl(mat) {
   if (!mat?.file_path) return ''
   // file_path 格式: /Users/.../backend/uploads/4/page-02.png
   // 转为: http://localhost:8000/uploads/4/page-02.png
   const uploadsIndex = mat.file_path.indexOf('/uploads/')
-  if (uploadsIndex === -1) return ''
+  if (uploadsIndex === -1) {
+    console.warn('[OCR] file_path 不含 /uploads/，无法生成预览URL:', mat.file_path)
+    return ''
+  }
   const relativePath = mat.file_path.substring(uploadsIndex)
-  return `http://localhost:8000${relativePath}`
+  return getBackendUrl(relativePath)
 }
 
 // 查看原图
