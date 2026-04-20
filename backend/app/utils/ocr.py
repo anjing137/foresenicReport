@@ -64,6 +64,8 @@ def run_ocr(image_path: str, save_dir: str = None) -> Dict[str, Any]:
     for attempt in range(max_retries):
         try:
             pipeline = _get_ocr_pipeline()
+            if not settings.SILICONFLOW_API_KEY:
+                return {"success": False, "error": "未配置 SILICONFLOW_API_KEY，请联系管理员配置 .env 文件中的 API Key"}
             output = pipeline.predict(image_path)
 
             all_blocks = []

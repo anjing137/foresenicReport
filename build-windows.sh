@@ -29,7 +29,8 @@ echo "      Frontend build done"
 echo "[2/5] Copying backend..."
 mkdir -p "$DIST_DIR/backend/app"
 cp -r "$PROJECT_DIR/backend/main.py" "$DIST_DIR/backend/"
-cp -r "$PROJECT_DIR/backend/.env" "$DIST_DIR/backend/" 2>/dev/null || true
+# 不复制 .env（含敏感信息），改为复制 .env.example 模板
+cp "$PROJECT_DIR/backend/.env.example" "$DIST_DIR/backend/.env.example"
 cp -r "$PROJECT_DIR/backend/requirements.txt" "$DIST_DIR/backend/"
 cp -r "$PROJECT_DIR/backend/app/" "$DIST_DIR/backend/app/"
 
@@ -42,6 +43,7 @@ cp -r "$PROJECT_DIR/frontend/dist" "$DIST_DIR/backend/static"
 echo "[4/5] Copying startup scripts..."
 cp "$PROJECT_DIR/start.bat" "$DIST_DIR/"
 cp "$PROJECT_DIR/stop.bat" "$DIST_DIR/"
+cp "$PROJECT_DIR/README_Windows.md" "$DIST_DIR/README.txt"
 # Ensure CRLF line endings for Windows CMD
 find "$DIST_DIR" -name "*.bat" -exec perl -pi -e 's/\r?\n/\r\n/' {} \;
 
@@ -76,6 +78,7 @@ echo ""
 echo "  Usage:"
 echo "  1. Send zip to Windows user"
 echo "  2. Extract to any folder (avoid Chinese/space in path)"
-echo "  3. Double-click start.bat"
-echo "  4. Open browser: http://localhost:8000"
+echo "  3. FIRST TIME: copy backend\.env.example to backend\.env and fill in your API Key"
+echo "  4. Double-click start.bat"
+echo "  5. Open browser: http://localhost:8000"
 echo "========================================"
