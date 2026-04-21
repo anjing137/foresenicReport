@@ -28,6 +28,355 @@
           <span><el-icon><Upload /></el-icon> 上传材料</span>
         </template>
         <div class="upload-panel">
+          <!-- ===== PDF 转换区 ===== -->
+          <div class="pdf-section">
+            <div class="pdf-section-header">
+              <span class="pdf-section-title">
+                <el-icon><Document /></el-icon> PDF 转换
+              </span>
+              <div class="pdf-view-toggle">
+                <el-button-group size="small">
+                  <el-button :type="pdfViewMode === 'thumbnail' ? 'primary' : ''" @click="pdfViewMode = 'thumbnail'">
+                    <el-icon><Grid /></el-icon> 缩略图
+                  </el-button>
+                  <el-button :type="pdfViewMode === 'list' ? 'primary' : ''" @click="pdfViewMode = 'list'">
+                    <el-icon><List /></el-icon> 列表
+                  </el-button>
+                </el-button-group>
+              </div>
+            </div>
+
+            <!-- 上传区 -->
+            <div class="pdf-upload-area">
+              <input ref="pdfUploadInput" type="file" accept=".pdf" style="display: none;" @change="handlePdfFileSelected" />
+              <el-button type="primary" size="default" @click="triggerPdfUpload">
+                <el-icon><Upload /></el-icon> 上传 PDF 文件
+              </el-button>
+              <span class="pdf-hint">支持 .pdf 文件，点击或拖拽上传</span>
+
+              <!-- 待转换的 PDF 列表 -->
+              <div v-if="uploadedPdfs.filter(p => !p.converted).length" class="uploaded-pdfs">
+                <el-divider content-position="left">待转换 PDF</el-divider>
+                <div v-for="pdf in uploadedPdfs.filter(p => !p.converted)" :key="pdf.tempId" class="pdf-item">
+                  <el-icon><Document /></el-icon>
+                  <span class="pdf-name">{{ pdf.filename }}</span>
+                  <span class="pdf-size">{{ (pdf.size / 1024).toFixed(1) }} KB</span>
+                  <el-button
+                    v-if="!pdf.converting"
+                    type="primary"
+                    size="small"
+                    @click="convertPdf(pdf)"
+                    :loading="pdf.converting"
+                  >
+                    转成图片
+                  </el-button>
+                  <el-button
+                    link
+                    type="danger"
+                    size="small"
+                    @click="removeUploadedPdf(pdf.tempId)"
+                  >
+                    删除
+                  </el-button>
+                </div>
+              </div>
+
+              <!-- 已转换的 PDF 列表 -->
+              <div v-if="uploadedPdfs.filter(p => p.converted).length" class="converted-pdfs">
+                <el-divider content-position="left">已转换 PDF</el-divider>
+                <div v-for="pdf in uploadedPdfs.filter(p => p.converted)" :key="pdf.tempId" class="pdf-item">
+                  <el-icon><Document /></el-icon>
+                  <span class="pdf-name">{{ pdf.filename }}</span>
+                  <el-tag type="success" size="small">已转换 {{ pdf.pageCount }} 页</el-tag>
+                  <el-button
+                    link
+                    type="danger"
+                    size="small"
+                    @click="removeUploadedPdf(pdf.tempId)"
+                  >
+                    删除
+                  </el-button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 转换进度 -->
+            <div v-if="pdfConverting" class="pdf-converting">
+              <el-icon class="is-loading" size="20"><Loading /></el-icon>
+              <span>正在转换 PDF，请稍候...</span>
+            </div>
+
+            <!-- PDF 折叠面板视图 -->
+            <div v-if="uploadedPdfs.length && !pdfConverting" class="pdf-fold-view">
+              <div class="pdf-fold-toolbar">
+                <span class="selected-count" v-if="selectedPdfPages.length">
+                  已选 {{ selectedPdfPages.length }} 张
+                </span>
+                <div class="import-controls" v-if="selectedPdfPages.length">
+                  <el-select v-model="importTargetType" placeholder="选择类型" size="small" style="width: 140px;">
+                    <el-option v-for="cat in materialCategories" :key="cat.type" :label="cat.label" :value="cat.type" />
+                  </el-select>
+                  <el-select
+                    v-if="getCategoryGrouped(importTargetType)"
+                    v-model="importTargetGroupId"
+                    placeholder="选择医院"
+                    size="small"
+                    style="width: 160px;"
+                    clearable
+                  >
+                    <el-option
+                      v-for="g in getGroupsForType(importTargetType)"
+                      :key="g.id"
+                      :label="g.group_name"
+                      :value="g.id"
+                    />
+                  </el-select>
+                  <el-input
+                    v-if="getCategoryGrouped(importTargetType) && !importTargetGroupId"
+                    v-model="pdfNewGroupName"
+                    placeholder="新建医院组名"
+                    size="small"
+                    style="width: 120px;"
+                  />
+                  <el-button type="primary" size="small" @click="importSelectedPdfPages">
+                    导入选中
+                  </el-button>
+                </div>
+              </div>
+
+              <!-- 每个 PDF 的折叠卡片 -->
+              <div v-for="pdf in uploadedPdfs" :key="pdf.tempId" class="pdf-fold-card">
+                <!-- PDF 头部：可点击展开/折叠 -->
+                <div class="pdf-fold-header" @click="pdf.expanded = !pdf.expanded">
+                  <div class="pdf-fold-left">
+                    <el-icon class="fold-arrow" :class="{ 'is-expanded': pdf.expanded }">
+                      <ArrowRight />
+                    </el-icon>
+                    <el-icon class="pdf-icon"><Document /></el-icon>
+                    <span class="pdf-filename" :title="pdf.filename">{{ pdf.filename }}</span>
+                    <el-tag v-if="pdf.converted" type="success" size="small">
+                      {{ pdf.pageCount }} 页
+                    </el-tag>
+                    <el-tag v-else type="info" size="small">待转换</el-tag>
+                  </div>
+                  <div class="pdf-fold-right">
+                    <template v-if="pdf.converted && pdf.pages">
+                      <span class="page-summary">
+                        已导入 {{ pdf.pages.filter(p => p.imported).length }} / {{ pdf.pages.length }} 页
+                      </span>
+                      <el-checkbox
+                        :model-value="getPdfSelectedCount(pdf.tempId) === pdf.pages.filter(p => !p.imported).length && pdf.pages.filter(p => !p.imported).length > 0"
+                        :indeterminate="getPdfSelectedCount(pdf.tempId) > 0 && getPdfSelectedCount(pdf.tempId) < pdf.pages.filter(p => !p.imported).length"
+                        @click.stop
+                        @change="(checked) => toggleAllPdfPagesOfPdf(pdf, checked)"
+                      />
+                    </template>
+                    <el-button
+                      v-if="!pdf.converted && !pdf.converting"
+                      type="primary"
+                      size="small"
+                      @click.stop="convertPdf(pdf)"
+                    >
+                      转成图片
+                    </el-button>
+                    <span v-if="pdf.converting" class="converting-text">
+                      <el-icon class="is-loading"><Loading /></el-icon> 转换中...
+                    </span>
+                    <el-button
+                      link
+                      type="danger"
+                      size="small"
+                      @click.stop="removeUploadedPdf(pdf.tempId)"
+                      title="删除"
+                    >
+                      <el-icon><Delete /></el-icon>
+                    </el-button>
+                  </div>
+                </div>
+
+                <!-- PDF 内容：缩略图/列表（展开时显示） -->
+                <div v-if="pdf.expanded && pdf.converted && pdf.pages" class="pdf-fold-body">
+                  <!-- 内嵌工具栏 -->
+                  <div class="pdf-fold-toolbar-inline">
+                    <el-checkbox
+                      :model-value="getPdfSelectedCount(pdf.tempId) === pdf.pages.filter(p => !p.imported).length && pdf.pages.filter(p => !p.imported).length > 0"
+                      :indeterminate="getPdfSelectedCount(pdf.tempId) > 0 && getPdfSelectedCount(pdf.tempId) < pdf.pages.filter(p => !p.imported).length"
+                      @change="(checked) => toggleAllPdfPagesOfPdf(pdf, checked)"
+                    >
+                      全选
+                    </el-checkbox>
+                    <span class="selected-count" v-if="getPdfSelectedCount(pdf.tempId)">
+                      已选 {{ getPdfSelectedCount(pdf.tempId) }} 张
+                    </span>
+                    <div class="import-controls-inline" v-if="getPdfSelectedCount(pdf.tempId)">
+                      <el-select v-model="importTargetType" placeholder="选择类型" size="small" style="width: 130px;">
+                        <el-option v-for="cat in materialCategories" :key="cat.type" :label="cat.label" :value="cat.type" />
+                      </el-select>
+                      <el-select
+                        v-if="getCategoryGrouped(importTargetType)"
+                        v-model="importTargetGroupId"
+                        placeholder="选择医院"
+                        size="small"
+                        style="width: 150px;"
+                        clearable
+                      >
+                        <el-option
+                          v-for="g in getGroupsForType(importTargetType)"
+                          :key="g.id"
+                          :label="g.group_name"
+                          :value="g.id"
+                        />
+                      </el-select>
+                      <el-input
+                        v-if="getCategoryGrouped(importTargetType) && !importTargetGroupId"
+                        v-model="pdfNewGroupName"
+                        placeholder="新建医院组"
+                        size="small"
+                        style="width: 110px;"
+                      />
+                      <el-button type="primary" size="small" @click="importSelectedPdfPagesOfPdf(pdf)">
+                        导入选中
+                      </el-button>
+                    </div>
+                  </div>
+
+                  <!-- 缩略图视图 -->
+                  <div v-if="pdfViewMode === 'thumbnail'" class="pdf-pages-grid">
+                    <div
+                      v-for="page in pdf.pages"
+                      :key="page.filename"
+                      class="pdf-page-thumb"
+                      :class="{ 'is-imported': page.imported, 'is-selected': selectedPdfPages.some(s => s.pdfTempId === pdf.tempId && s.filename === page.filename) }"
+                    >
+                      <div class="thumb-select">
+                        <el-checkbox
+                          :model-value="selectedPdfPages.some(s => s.pdfTempId === pdf.tempId && s.filename === page.filename)"
+                          :disabled="page.imported"
+                          @change="togglePdfPageSelection(pdf.tempId, page.filename)"
+                        />
+                      </div>
+                      <div class="thumb-image" @click="viewPdfPage(page)">
+                        <img :src="getBackendUrl(page.url)" :alt="page.filename" />
+                        <div v-if="page.imported" class="thumb-imported-badge">
+                          <el-tag size="small" type="success">已导入</el-tag>
+                        </div>
+                      </div>
+                      <div class="thumb-info">
+                        <span class="thumb-filename" :title="page.filename">{{ page.filename }}</span>
+                      </div>
+                      <div class="thumb-actions">
+                        <el-button link type="primary" size="small" @click="viewPdfPage(page)" title="查看大图">
+                          <el-icon><ZoomIn /></el-icon>
+                        </el-button>
+                        <el-button
+                          v-if="!page.imported"
+                          link
+                          type="danger"
+                          size="small"
+                          @click="deletePdfPage(page)"
+                          title="删除"
+                        >
+                          <el-icon><Delete /></el-icon>
+                        </el-button>
+                        <el-button
+                          v-if="page.imported"
+                          link
+                          type="warning"
+                          size="small"
+                          @click="revertPdfImport(page)"
+                          title="撤销导入"
+                        >
+                          <el-icon><RefreshLeft /></el-icon>
+                        </el-button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 列表视图 -->
+                  <div v-if="pdfViewMode === 'list'" class="pdf-list-view-inner">
+                    <el-table :data="pdf.pages" size="small" stripe>
+                      <el-table-column width="50">
+                        <template #header>
+                          <el-checkbox
+                            :model-value="getPdfSelectedCount(pdf.tempId) === pdf.pages.filter(p => !p.imported).length && pdf.pages.filter(p => !p.imported).length > 0"
+                            :indeterminate="getPdfSelectedCount(pdf.tempId) > 0 && getPdfSelectedCount(pdf.tempId) < pdf.pages.filter(p => !p.imported).length"
+                            @change="(checked) => toggleAllPdfPagesOfPdf(pdf, checked)"
+                          />
+                        </template>
+                        <template #default="{ row }">
+                          <el-checkbox
+                            :model-value="selectedPdfPages.some(s => s.pdfTempId === pdf.tempId && s.filename === row.filename)"
+                            :disabled="row.imported"
+                            @change="togglePdfPageSelection(pdf.tempId, row.filename)"
+                          />
+                        </template>
+                      </el-table-column>
+                      <el-table-column prop="filename" label="文件名" show-overflow-tooltip />
+                      <el-table-column label="状态" width="100" align="center">
+                        <template #default="{ row }">
+                          <el-tag v-if="row.imported" type="success" size="small">已导入</el-tag>
+                          <el-tag v-else type="info" size="small">未导入</el-tag>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="操作" width="100" align="center">
+                        <template #default="{ row }">
+                          <el-button link type="primary" size="small" @click="viewPdfPage(row)">查看</el-button>
+                          <el-button
+                            v-if="!row.imported"
+                            link
+                            type="danger"
+                            size="small"
+                            @click="deletePdfPage(row)"
+                          >删除</el-button>
+                          <el-button
+                            v-if="row.imported"
+                            link
+                            type="warning"
+                            size="small"
+                            @click="revertPdfImport(row)"
+                          >撤销</el-button>
+                        </template>
+                      </el-table-column>
+                    </el-table>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 已导入列表 -->
+            <div v-if="importedPdfPages.length" class="pdf-imported-list">
+              <div class="imported-header" @click="showImportedList = !showImportedList">
+                <el-icon>
+                  <component :is="showImportedList ? 'ArrowDown' : 'ArrowRight'" />
+                </el-icon>
+                <span>已导入 ({{ importedPdfPages.length }}张)</span>
+              </div>
+              <div v-if="showImportedList" class="imported-items">
+                <div v-for="item in importedPdfPages" :key="item.filename" class="imported-item">
+                  <span class="imported-icon">
+                    <el-icon v-if="item.group_name"><OfficeBuilding /></el-icon>
+                    <el-icon v-else><Document /></el-icon>
+                  </span>
+                  <span class="imported-filename">{{ item.filename }}</span>
+                  <span class="imported-arrow">→</span>
+                  <el-tag size="small" :type="item.group_name ? 'warning' : 'primary'">
+                    {{ item.group_name ? item.group_name + ' / ' : '' }}{{ item.material_type_label }}
+                  </el-tag>
+                  <div class="imported-actions">
+                    <el-button link type="primary" size="small" @click="viewPdfPageByFilename(item.filename)">查看</el-button>
+                    <el-button link type="warning" size="small" @click="revertPdfImportByFilename(item.filename)">撤销</el-button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 分隔线 -->
+          <el-divider content-position="center">
+            <span style="color: #909399; font-size: 12px;">— 已上传材料 —</span>
+          </el-divider>
+
+          <!-- 已有材料分类列表 -->
           <div v-for="cat in materialCategories" :key="cat.type" class="material-category">
             <div class="category-header">
               <div class="category-info">
@@ -128,9 +477,21 @@
         <div class="ocr-panel">
           <!-- 操作栏 -->
           <div class="ocr-toolbar" v-if="!isCompleted">
-            <el-button type="primary" @click="handleRecognizeAll" :loading="ocrRunning" :disabled="pendingCount === 0">
-              <el-icon><VideoCamera /></el-icon> 全部识别（{{ pendingCount }}张待识别）
-            </el-button>
+            <!-- 识别中显示停止按钮 -->
+            <template v-if="ocrRunning">
+              <el-button type="warning" @click="handleStopRecognize">
+                <el-icon><VideoCamera /></el-icon> 停止识别（等当前张完成）
+              </el-button>
+              <el-button type="danger" @click="handleForceStopRecognize">
+                <el-icon><Switch /></el-icon> 强制停止（立刻中断）
+              </el-button>
+            </template>
+            <!-- 非识别中显示开始按钮 -->
+            <template v-else>
+              <el-button type="primary" @click="handleRecognizeAll" :disabled="pendingCount === 0">
+                <el-icon><VideoCamera /></el-icon> 全部识别（{{ pendingCount }}张待识别）
+              </el-button>
+            </template>
             <el-button @click="loadCase" :disabled="ocrRunning">
               <el-icon><Refresh /></el-icon> 刷新状态
             </el-button>
@@ -952,6 +1313,72 @@
         <el-button type="primary" @click="saveImagingReport" :loading="saving">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- PDF 页面查看对话框 -->
+    <el-dialog v-model="showPdfImageDialog" :title="viewingPdfPage?.filename || 'PDF页面'" width="80%" top="3vh">
+      <div v-if="viewingPdfPage?.url" class="original-image-view" ref="pdfImageContainerRef"
+        @mousedown="onPdfImageDragStart"
+        @mousemove="onPdfImageDragMove"
+        @mouseup="onPdfImageDragEnd"
+        @mouseleave="onPdfImageDragEnd"
+        :style="{ cursor: pdfImageZoom > 1 ? (pdfIsDragging ? 'grabbing' : 'grab') : 'default' }">
+        <img :src="getBackendUrl(viewingPdfPage.url)" :alt="viewingPdfPage?.filename"
+          :style="{ transform: `scale(${pdfImageZoom})`, transformOrigin: 'left top' }" />
+      </div>
+      <el-empty v-else description="无图片" />
+
+      <!-- 查看器控制栏 -->
+      <div class="pdf-viewer-controls">
+        <div class="zoom-controls">
+          <el-button size="small" @click="pdfZoomOut" :disabled="pdfImageZoom <= 0.5">
+            <el-icon><ZoomOut /></el-icon>
+          </el-button>
+          <span class="zoom-label">{{ Math.round(pdfImageZoom * 100) }}%</span>
+          <el-button size="small" @click="pdfZoomIn" :disabled="pdfImageZoom >= 3">
+            <el-icon><ZoomIn /></el-icon>
+          </el-button>
+          <el-button size="small" @click="pdfZoomReset">重置</el-button>
+        </div>
+
+        <!-- 导入控制 -->
+        <div v-if="viewingPdfPage && !viewingPdfPage.imported" class="import-controls-inline">
+          <el-select v-model="viewingPdfImportType" placeholder="选择类型" size="small" style="width: 140px;">
+            <el-option v-for="cat in materialCategories" :key="cat.type" :label="cat.label" :value="cat.type" />
+          </el-select>
+          <el-select
+            v-if="getCategoryGrouped(viewingPdfImportType)"
+            v-model="viewingPdfImportGroupId"
+            placeholder="选择医院"
+            size="small"
+            style="width: 140px;"
+            clearable
+          >
+            <el-option
+              v-for="g in getGroupsForType(viewingPdfImportType)"
+              :key="g.id"
+              :label="g.group_name"
+              :value="g.id"
+            />
+          </el-select>
+          <el-input
+            v-if="getCategoryGrouped(viewingPdfImportType) && !viewingPdfImportGroupId"
+            v-model="viewingPdfNewGroupName"
+            placeholder="新建医院组名"
+            size="small"
+            style="width: 120px;"
+          />
+          <el-button type="primary" size="small" @click="importViewingPage" :loading="importingPdfPage">
+            导入此页
+          </el-button>
+        </div>
+        <div v-else-if="viewingPdfPage?.imported" class="imported-status">
+          <el-tag type="success" size="small">已导入到: {{ viewingPdfPage.material_type_label || viewingPdfPage.material_type }}</el-tag>
+          <el-button link type="warning" size="small" @click="revertViewingPdfPage" :loading="revertingPdfPage">
+            撤销导入
+          </el-button>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -962,7 +1389,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Upload, Plus, VideoCamera, Check, CircleCheck, RefreshLeft,
   Document, Refresh, PictureFilled, Files, Postcard, Notebook, FirstAidKit,
-  Edit, MagicStick, Loading, Download, ZoomIn, ZoomOut, OfficeBuilding
+  Edit, MagicStick, Loading, Download, ZoomIn, ZoomOut, OfficeBuilding,
+  Grid, List, Delete, ArrowDown, ArrowRight
 } from '@element-plus/icons-vue'
 import api from '@/api'
 
@@ -1016,6 +1444,33 @@ const showOcrDialog = ref(false)
 const showImageDialog = ref(false)
 const viewingMaterial = ref(null)
 const ocrViewMode = ref('render')  // 'render' | 'raw'
+
+// PDF 转换相关
+const pdfUploadInput = ref(null)
+const pdfUploadRef = ref(null)
+const pdfViewMode = ref('thumbnail')  // 'thumbnail' | 'list'
+// const pdfPages = ref([])  // 移除，统一从 uploadedPdfs 获取
+const pdfConverting = ref(false)
+const selectedPdfPages = ref([])  // [{pdfTempId, filename}]
+const importTargetType = ref('')
+const importTargetGroupId = ref(null)
+const pdfNewGroupName = ref('')
+const importedPdfPages = ref([])
+const showImportedList = ref(true)
+const uploadedPdfs = ref([])  // [{tempId, filename, size, file, converting, converted, pageCount, expanded, pages}]
+
+// PDF 查看相关
+const showPdfImageDialog = ref(false)
+const viewingPdfPage = ref(null)
+const pdfImageZoom = ref(1)
+const pdfIsDragging = ref(false)
+const pdfDragStart = ref({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
+const pdfImageContainerRef = ref(null)
+const viewingPdfImportType = ref('')
+const viewingPdfImportGroupId = ref(null)
+const viewingPdfNewGroupName = ref('')
+const importingPdfPage = ref(false)
+const revertingPdfPage = ref(false)
 
 // 轻量 Markdown → HTML 渲染（覆盖OCR文本常见格式）
 function renderOcrMarkdown(md) {
@@ -1202,6 +1657,496 @@ function onImageDragEnd() {
   isDragging.value = false
 }
 
+// PDF 查看相关（复用图片缩放逻辑）
+function pdfZoomIn() {
+  if (pdfImageZoom.value < 3) pdfImageZoom.value = Math.min(3, Math.round((pdfImageZoom.value + 0.25) * 100) / 100)
+}
+function pdfZoomOut() {
+  if (pdfImageZoom.value > 0.5) pdfImageZoom.value = Math.max(0.5, Math.round((pdfImageZoom.value - 0.25) * 100) / 100)
+}
+function pdfZoomReset() {
+  pdfImageZoom.value = 1
+  if (pdfImageContainerRef.value) {
+    pdfImageContainerRef.value.scrollLeft = 0
+    pdfImageContainerRef.value.scrollTop = 0
+  }
+}
+function onPdfImageDragStart(e) {
+  if (pdfImageZoom.value <= 1) return
+  pdfIsDragging.value = true
+  pdfDragStart.value = {
+    x: e.clientX,
+    y: e.clientY,
+    scrollLeft: pdfImageContainerRef.value?.scrollLeft || 0,
+    scrollTop: pdfImageContainerRef.value?.scrollTop || 0
+  }
+  e.preventDefault()
+}
+function onPdfImageDragMove(e) {
+  if (!pdfIsDragging.value) return
+  const dx = e.clientX - pdfDragStart.value.x
+  const dy = e.clientY - pdfDragStart.value.y
+  if (pdfImageContainerRef.value) {
+    pdfImageContainerRef.value.scrollLeft = pdfDragStart.value.scrollLeft - dx
+    pdfImageContainerRef.value.scrollTop = pdfDragStart.value.scrollTop - dy
+  }
+}
+function onPdfImageDragEnd() {
+  pdfIsDragging.value = false
+}
+
+// PDF 上传与转换
+function triggerPdfUpload() {
+  pdfUploadInput.value?.click()
+}
+function handlePdfFileSelected(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  const rawFile = file
+  if (!rawFile.name?.toLowerCase().endsWith('.pdf')) {
+    ElMessage.error('只支持 PDF 文件')
+    return
+  }
+  // 只是添加到待转换列表，不自动转换
+  const tempId = Date.now() + Math.random()
+  uploadedPdfs.value.push({
+    tempId,
+    filename: rawFile.name,
+    size: rawFile.size || 0,
+    file: rawFile,
+    converting: false,
+    converted: false,
+    pageCount: 0
+  })
+}
+async function convertPdf(pdfItem) {
+  // 找到对应的 PDF 项并标记为转换中
+  const target = uploadedPdfs.value.find(p => p.tempId === pdfItem.tempId)
+  if (!target) return
+  target.converting = true
+  try {
+    const result = await api.uploadPdf(caseId, target.file)
+    if (result.pages && result.pages.length > 0) {
+      // 存储到该 PDF 的 pages 中
+      target.pages = result.pages.map(p => ({ ...p, imported: false, material_id: null }))
+      target.converted = true
+      target.pageCount = result.total_pages
+      target.filename = result.pdf_filename  // 使用返回的原始文件名
+      target.expanded = true  // 转换后默认展开
+      // 保存文件名前缀，用于删除时定位文件
+      const firstPage = result.pages[0]
+      const prefixMatch = firstPage.filename.match(/^(case\d+_\w+)-\d+\.png$/)
+      target.prefix = prefixMatch ? prefixMatch[1] : null
+      ElMessage.success(`PDF 转换完成，共 ${result.total_pages} 页`)
+    }
+    await refreshImportedPdfPages()
+  } catch (e) {
+    console.error('PDF 转换失败', e)
+    ElMessage.error('PDF 转换失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    target.converting = false
+  }
+}
+async function removeUploadedPdf(tempId) {
+  const pdf = uploadedPdfs.value.find(p => p.tempId === tempId)
+  if (!pdf) return
+  // 如果已转换，删除后端的文件和数据库记录
+  if (pdf.converted && pdf.prefix) {
+    try {
+      await ElMessageBox.confirm(`确定要删除 "${pdf.filename}" 吗？将同时删除所有页面和原始 PDF 文件`, '确认删除', { type: 'warning' })
+      const result = await api.deletePdf(caseId, pdf.prefix)
+      ElMessage.success(result.message || '已删除')
+    } catch (e) {
+      if (e !== 'cancel') {
+        ElMessage.error('删除失败: ' + (e.response?.data?.detail || e.message))
+      }
+      return
+    }
+  }
+  // 从前端列表移除
+  const idx = uploadedPdfs.value.findIndex(p => p.tempId === tempId)
+  if (idx >= 0) {
+    uploadedPdfs.value.splice(idx, 1)
+  }
+}
+async function loadPdfPages() {
+  try {
+    const pages = await api.getPdfPages(caseId)
+    // 按 PDF 前缀分组到 uploadedPdfs
+    const pdfMap = {}
+    pages.forEach(p => {
+      // 从 filename 提取 PDF 前缀，如 case123_abc-1.png -> case123_abc
+      const match = p.filename.match(/^(case\d+_\w+)-\d+\.png$/)
+      if (match) {
+        const prefix = match[1]
+        if (!pdfMap[prefix]) {
+          pdfMap[prefix] = {
+            tempId: 'loaded_' + prefix,
+            filename: p.original_pdf_filename || (prefix + '.pdf'),
+            prefix: prefix,
+            size: 0,
+            file: null,
+            converting: false,
+            converted: true,
+            pageCount: 0,
+            expanded: true,
+            pages: []
+          }
+        }
+        pdfMap[prefix].pages.push({ ...p, imported: p.imported, material_id: p.material_id })
+        pdfMap[prefix].pageCount++
+      }
+    })
+    uploadedPdfs.value = Object.values(pdfMap)
+    await refreshImportedPdfPages()
+  } catch (e) {
+    console.error('加载 PDF 页面失败', e)
+  }
+}
+async function refreshImportedPdfPages() {
+  const pages = await api.getPdfPages(caseId)
+  importedPdfPages.value = pages
+    .filter(p => p.imported)
+    .map(p => ({
+      filename: p.filename,
+      material_id: p.material_id,
+      material_type: p.material_type,
+      material_type_label: p.material_type_label,
+      group_id: p.group_id,
+      group_name: null  // 暂不获取分组名
+    }))
+}
+function viewPdfPage(page) {
+  viewingPdfPage.value = page
+  pdfImageZoom.value = 1
+  showPdfImageDialog.value = true
+}
+function viewPdfPageByFilename(filename) {
+  const found = findPdfAndPage(filename)
+  if (found) {
+    viewingPdfPage.value = found.page
+    pdfImageZoom.value = 1
+    showPdfImageDialog.value = true
+  }
+}
+function togglePdfPageSelection(pdfTempId, filename) {
+  const key = pdfTempId + '::' + filename
+  const idx = selectedPdfPages.value.findIndex(s => s.pdfTempId === pdfTempId && s.filename === filename)
+  if (idx >= 0) {
+    selectedPdfPages.value.splice(idx, 1)
+  } else {
+    selectedPdfPages.value.push({ pdfTempId, filename })
+  }
+}
+function togglePdfPageSelectionByKey(key) {
+  const idx = selectedPdfPages.value.findIndex(s => (s.pdfTempId + '::' + s.filename) === key)
+  if (idx >= 0) {
+    selectedPdfPages.value.splice(idx, 1)
+  } else {
+    const [pdfTempId, filename] = key.split('::')
+    selectedPdfPages.value.push({ pdfTempId, filename })
+  }
+}
+function toggleAllPdfPagesOfPdf(pdf, checked) {
+  if (checked) {
+    pdf.pages.forEach(p => {
+      if (!p.imported && !selectedPdfPages.value.some(s => s.pdfTempId === pdf.tempId && s.filename === p.filename)) {
+        selectedPdfPages.value.push({ pdfTempId: pdf.tempId, filename: p.filename })
+      }
+    })
+  } else {
+    selectedPdfPages.value = selectedPdfPages.value.filter(s => s.pdfTempId !== pdf.tempId)
+  }
+}
+function toggleAllPdfPages(checked) {
+  if (checked) {
+    uploadedPdfs.value.forEach(pdf => {
+      pdf.pages.forEach(p => {
+        if (!p.imported && !selectedPdfPages.value.some(s => s.pdfTempId === pdf.tempId && s.filename === p.filename)) {
+          selectedPdfPages.value.push({ pdfTempId: pdf.tempId, filename: p.filename })
+        }
+      })
+    })
+  } else {
+    selectedPdfPages.value = []
+  }
+}
+function getPdfSelectedCount(pdfTempId) {
+  return selectedPdfPages.value.filter(s => s.pdfTempId === pdfTempId).length
+}
+const isAllPdfPagesSelected = computed(() => {
+  const allNotImported = []
+  uploadedPdfs.value.forEach(pdf => {
+    pdf.pages.forEach(p => {
+      if (!p.imported) allNotImported.push(pdf.tempId + '::' + p.filename)
+    })
+  })
+  if (allNotImported.length === 0) return false
+  return allNotImported.every(key => selectedPdfPages.value.some(s => (s.pdfTempId + '::' + s.filename) === key))
+})
+const isSomePdfPagesSelected = computed(() => {
+  const allNotImported = []
+  uploadedPdfs.value.forEach(pdf => {
+    pdf.pages.forEach(p => {
+      if (!p.imported) allNotImported.push(pdf.tempId + '::' + p.filename)
+    })
+  })
+  const selected = allNotImported.filter(key => selectedPdfPages.value.some(s => (s.pdfTempId + '::' + s.filename) === key))
+  return selected.length > 0 && selected.length < allNotImported.length
+})
+// 辅助函数：在所有 PDF 中查找页面
+function findPdfAndPage(filename) {
+  for (const pdf of uploadedPdfs.value) {
+    const page = pdf.pages?.find(p => p.filename === filename)
+    if (page) return { pdf, page }
+  }
+  return null
+}
+async function deletePdfPage(page) {
+  try {
+    await ElMessageBox.confirm('确定要删除该页面吗？删除后不可恢复', '确认删除', { type: 'warning' })
+    await api.deletePdfPage(caseId, page.filename)
+    // 从对应 PDF 中移除
+    for (const pdf of uploadedPdfs.value) {
+      const idx = pdf.pages?.findIndex(p => p.filename === page.filename)
+      if (idx >= 0) {
+        pdf.pages.splice(idx, 1)
+        pdf.pageCount--
+        break
+      }
+    }
+    selectedPdfPages.value = selectedPdfPages.value.filter(s => s.filename !== page.filename)
+    ElMessage.success('已删除')
+  } catch (e) {
+    if (e !== 'cancel') {
+      ElMessage.error('删除失败: ' + (e.response?.data?.detail || e.message))
+    }
+  }
+}
+async function revertPdfImport(page) {
+  try {
+    await ElMessageBox.confirm('确定要撤销导入吗？文件将保留在转换结果中', '确认撤销', { type: 'warning' })
+    await api.revertPdfImport(caseId, page.filename)
+    // 更新本地状态
+    const found = findPdfAndPage(page.filename)
+    if (found) {
+      found.page.imported = false
+      found.page.material_id = null
+      found.page.material_type = null
+      found.page.material_type_label = null
+    }
+    await refreshImportedPdfPages()
+    // 刷新材料列表
+    await loadMaterialsGrouped()
+    ElMessage.success('已撤销导入')
+  } catch (e) {
+    ElMessage.error('撤销失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+async function revertPdfImportByFilename(filename) {
+  const found = findPdfAndPage(filename)
+  if (found) {
+    await revertPdfImport(found.page)
+  }
+}
+
+// 快速导入单个页面
+function onQuickImportTypeChange(row, type) {
+  // 分组类型需要选择医院组，暂时不支持快速导入分组类型
+  const cat = materialCategories.find(c => c.type === type)
+  if (cat?.grouped) {
+    ElMessage.warning('分组类型（病历/影像学报告）暂不支持单页快速导入，请使用批量导入')
+    row.quickImportType = null
+    return
+  }
+}
+
+async function quickImportSingle(row) {
+  if (!row.quickImportType) {
+    ElMessage.warning('请先选择导入类型')
+    return
+  }
+  try {
+    const data = {
+      filenames: [row.filename],
+      material_type: row.quickImportType,
+      group_id: null,
+      group_name: null
+    }
+    const result = await api.importPdfPages(caseId, data)
+    if (result.imported && result.imported.length > 0) {
+      ElMessage.success(`已导入: ${row.filename}`)
+    }
+    if (result.failed && result.failed.length > 0) {
+      ElMessage.warning(`${result.failed.length} 张导入失败`)
+    }
+    await loadPdfPages()
+    await loadMaterialsGrouped()
+  } catch (e) {
+    ElMessage.error('导入失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+// 查看对话框中的导入
+async function importViewingPage() {
+  if (!viewingPdfPage.value) return
+  if (!viewingPdfImportType.value) {
+    ElMessage.warning('请选择导入类型')
+    return
+  }
+  const cat = materialCategories.find(c => c.type === viewingPdfImportType.value)
+  if (cat?.grouped && !viewingPdfImportGroupId.value && !viewingPdfNewGroupName.value) {
+    ElMessage.warning('分组类型需要选择医院组或输入新建组名')
+    return
+  }
+
+  importingPdfPage.value = true
+  try {
+    const data = {
+      filenames: [viewingPdfPage.value.filename],
+      material_type: viewingPdfImportType.value,
+      group_id: viewingPdfImportGroupId.value || null,
+      group_name: viewingPdfNewGroupName.value || null
+    }
+    const result = await api.importPdfPages(caseId, data)
+    if (result.imported && result.imported.length > 0) {
+      ElMessage.success('已导入')
+    }
+    // 刷新
+    await loadPdfPages()
+    await loadMaterialsGrouped()
+    // 更新对话框中的页面信息
+    const updated = pdfPages.value.find(p => p.filename === viewingPdfPage.value.filename)
+    if (updated) {
+      viewingPdfPage.value = updated
+    }
+    // 清空
+    viewingPdfImportType.value = ''
+    viewingPdfImportGroupId.value = null
+    viewingPdfNewGroupName.value = ''
+  } catch (e) {
+    ElMessage.error('导入失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    importingPdfPage.value = false
+  }
+}
+
+async function revertViewingPdfPage() {
+  if (!viewingPdfPage.value) return
+  try {
+    await ElMessageBox.confirm('确定要撤销导入吗？文件将保留', '确认撤销', { type: 'warning' })
+    revertingPdfPage.value = true
+    await api.revertPdfImport(caseId, viewingPdfPage.value.filename)
+    ElMessage.success('已撤销导入')
+    await loadPdfPages()
+    await loadMaterialsGrouped()
+    // 更新对话框中的页面信息
+    const updated = pdfPages.value.find(p => p.filename === viewingPdfPage.value.filename)
+    if (updated) {
+      viewingPdfPage.value = updated
+    }
+  } catch (e) {
+    if (e !== 'cancel') {
+      ElMessage.error('撤销失败: ' + (e.response?.data?.detail || e.message))
+    }
+  } finally {
+    revertingPdfPage.value = false
+  }
+}
+
+async function importSelectedPdfPages() {
+  if (!selectedPdfPages.value.length) {
+    ElMessage.warning('请先选择要导入的页面')
+    return
+  }
+  if (!importTargetType.value) {
+    ElMessage.warning('请选择导入类型')
+    return
+  }
+  // 分组类型检查
+  const cat = materialCategories.find(c => c.type === importTargetType.value)
+  if (cat?.grouped && !importTargetGroupId.value && !pdfNewGroupName.value) {
+    ElMessage.warning('分组类型需要选择医院组或输入新建组名')
+    return
+  }
+
+  try {
+    const data = {
+      filenames: selectedPdfPages.value.map(s => s.filename),
+      material_type: importTargetType.value,
+      group_id: importTargetGroupId.value || null,
+      group_name: pdfNewGroupName.value || null
+    }
+    const result = await api.importPdfPages(caseId, data)
+    if (result.imported && result.imported.length > 0) {
+      ElMessage.success(`成功导入 ${result.imported.length} 张`)
+    }
+    if (result.failed && result.failed.length > 0) {
+      ElMessage.warning(`${result.failed.length} 张导入失败`)
+    }
+    // 刷新 PDF 页面状态
+    await loadPdfPages()
+    // 刷新材料列表（让导入的材料显示到对应分类下）
+    await loadMaterialsGrouped()
+    selectedPdfPages.value = []
+    pdfNewGroupName.value = ''
+    importTargetGroupId.value = null
+  } catch (e) {
+    console.error('导入失败', e)
+    ElMessage.error('导入失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+async function importSelectedPdfPagesOfPdf(pdf) {
+  // 导入该 PDF 下选中的页面
+  const selected = selectedPdfPages.value.filter(s => s.pdfTempId === pdf.tempId)
+  if (!selected.length) {
+    ElMessage.warning('请先选择要导入的页面')
+    return
+  }
+  if (!importTargetType.value) {
+    ElMessage.warning('请选择导入类型')
+    return
+  }
+  const cat = materialCategories.find(c => c.type === importTargetType.value)
+  if (cat?.grouped && !importTargetGroupId.value && !pdfNewGroupName.value) {
+    ElMessage.warning('分组类型需要选择医院组或输入新建组名')
+    return
+  }
+  try {
+    const data = {
+      filenames: selected.map(s => s.filename),
+      material_type: importTargetType.value,
+      group_id: importTargetGroupId.value || null,
+      group_name: pdfNewGroupName.value || null
+    }
+    const result = await api.importPdfPages(caseId, data)
+    if (result.imported && result.imported.length > 0) {
+      ElMessage.success(`成功导入 ${result.imported.length} 张`)
+    }
+    if (result.failed && result.failed.length > 0) {
+      ElMessage.warning(`${result.failed.length} 张导入失败`)
+    }
+    await loadPdfPages()
+    await loadMaterialsGrouped()
+    // 清除该 PDF 的选中
+    selectedPdfPages.value = selectedPdfPages.value.filter(s => s.pdfTempId !== pdf.tempId)
+  } catch (e) {
+    ElMessage.error('导入失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+// 辅助函数
+function getCategoryGrouped(type) {
+  const cat = materialCategories.find(c => c.type === type)
+  return cat?.grouped || false
+}
+function getGroupsForType(type) {
+  if (!materialsByType.value[type]) return []
+  return materialsByType.value[type]
+    .filter(g => g.group)
+    .map(g => g.group)
+}
+
 // 对话框
 const showRecordDialog = ref(false)
 const showAddRecordDialog = ref(false)
@@ -1335,6 +2280,8 @@ async function loadCase() {
       reportData.value = data.report
     }
     await loadMaterialsGrouped()
+    // 加载 PDF 转换页面
+    await loadPdfPages()
   } catch (e) {
     ElMessage.error('加载案件失败')
   }
@@ -1469,14 +2416,40 @@ async function handleRecognizeAll() {
   try {
     ocrRunning.value = true
     const result = await api.recognizeAll(caseId)
-    const completed = result.results?.filter(r => r.status === 'completed').length || 0
-    const failed = result.results?.filter(r => r.status === 'failed').length || 0
-    ElMessage.success(`识别完成：${completed}张成功，${failed}张失败`)
+    if (result.status === 'stopped') {
+      const completed = result.results?.filter(r => r.status === 'completed').length || 0
+      const failed = result.results?.filter(r => r.status === 'failed').length || 0
+      ElMessage.warning(`识别已停止（${result.stop_type === 'force' ? '强制' : '正常'}），已完成 ${completed} 张，失败 ${failed} 张`)
+    } else {
+      const completed = result.results?.filter(r => r.status === 'completed').length || 0
+      const failed = result.results?.filter(r => r.status === 'failed').length || 0
+      ElMessage.success(`识别完成：${completed}张成功，${failed}张失败`)
+    }
     await loadCase()
   } catch (e) {
     ElMessage.error('批量识别失败')
   } finally {
     ocrRunning.value = false
+  }
+}
+
+async function handleStopRecognize() {
+  try {
+    await api.stopRecognize(caseId)
+    ElMessage.info('已发出停止请求，当前张识别完后将停止')
+  } catch (e) {
+    ElMessage.error('停止请求失败')
+  }
+}
+
+async function handleForceStopRecognize() {
+  try {
+    await api.forceStopRecognize(caseId)
+    ocrRunning.value = false
+    ElMessage.warning('已强制停止，进程已中断')
+    await loadCase()
+  } catch (e) {
+    ElMessage.error('强制停止失败')
   }
 }
 
@@ -2032,6 +3005,563 @@ watch(showAddImagingDialog, (val) => {
   }
 }
 
+/* PDF 转换区 */
+.pdf-section {
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  background: #fafbfc;
+
+  .pdf-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+
+    .pdf-section-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      font-size: 14px;
+      color: #303133;
+    }
+
+    .pdf-view-toggle {
+      display: flex;
+      gap: 8px;
+    }
+  }
+
+  .pdf-upload-area {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 20px;
+    background: #f5f7fa;
+    border: 2px dashed #dcdfe6;
+    border-radius: 8px;
+    margin-bottom: 12px;
+
+    .pdf-upload-trigger {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .pdf-hint {
+      font-size: 12px;
+      color: #909399;
+    }
+  }
+
+  .pdf-converting {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px;
+    color: #409eff;
+    font-size: 14px;
+    justify-content: center;
+  }
+
+  // 缩略图视图
+  .pdf-thumbnail-view {
+    .pdf-thumb-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 16px;
+      padding: 12px 16px;
+      background: #f5f7fa;
+      border-radius: 8px;
+
+      .selected-count {
+        font-size: 13px;
+        color: #409eff;
+        font-weight: 500;
+      }
+
+      .import-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 1;
+      }
+    }
+
+    .pdf-pages-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .pdf-page-thumb {
+      position: relative;
+      border: 1px solid #e4e7ed;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #fff;
+      transition: all 0.2s;
+
+      &:hover {
+        border-color: #409eff;
+        box-shadow: 0 2px 8px rgba(64, 158, 255, 0.2);
+      }
+
+      &.is-imported {
+        background: #f0f9eb;
+        border-color: #67c23a;
+      }
+
+      &.is-selected {
+        border-color: #409eff;
+        box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.3);
+      }
+
+      .thumb-select {
+        position: absolute;
+        top: 4px;
+        left: 4px;
+        z-index: 3;
+        background: rgba(255, 255, 255, 0.9);
+        border-radius: 4px;
+        padding: 2px;
+        :deep(.el-checkbox) {
+          display: block;
+          --el-checkbox-size: 14px;
+          .el-checkbox__inner {
+            width: 16px;
+            height: 16px;
+          }
+        }
+      }
+
+      .thumb-image {
+        position: relative;
+        height: 120px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f5f7fa;
+        cursor: pointer;
+        overflow: hidden;
+
+        img {
+          max-width: 100%;
+          max-height: 100%;
+          object-fit: contain;
+        }
+
+        .thumb-imported-badge {
+          position: absolute;
+          top: 4px;
+          right: 4px;
+        }
+      }
+
+      .thumb-info {
+        padding: 6px 8px;
+        border-top: 1px solid #f0f0f0;
+
+        .thumb-filename {
+          font-size: 12px;
+          color: #606266;
+          display: block;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+      }
+
+      .thumb-actions {
+        display: flex;
+        justify-content: center;
+        gap: 4px;
+        padding: 4px 8px 6px;
+        border-top: 1px solid #f0f0f0;
+      }
+    }
+  }
+
+  // PDF 折叠面板视图
+  .pdf-fold-view {
+    margin-top: 12px;
+  }
+
+  .pdf-fold-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    background: #f5f7fa;
+    border-radius: 8px;
+    margin-bottom: 12px;
+
+    .selected-count {
+      font-size: 13px;
+      color: #606266;
+    }
+
+    .import-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+    }
+  }
+
+  .pdf-fold-card {
+    border: 1px solid #e4e7ed;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    overflow: hidden;
+    background: #fff;
+
+    &:hover {
+      border-color: #c0c4cc;
+    }
+  }
+
+  .pdf-fold-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    cursor: pointer;
+    background: #fafafa;
+    transition: background 0.2s;
+
+    &:hover {
+      background: #f0f0f0;
+    }
+
+    .pdf-fold-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+
+      .fold-arrow {
+        transition: transform 0.3s;
+        color: #909399;
+
+        &.is-expanded {
+          transform: rotate(90deg);
+        }
+      }
+
+      .pdf-icon {
+        color: #409eff;
+        font-size: 18px;
+      }
+
+      .pdf-filename {
+        font-weight: 500;
+        color: #303133;
+        max-width: 300px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    }
+
+    .pdf-fold-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+
+      .page-summary {
+        font-size: 12px;
+        color: #909399;
+      }
+
+      .converting-text {
+        color: #409eff;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+    }
+  }
+
+  .pdf-fold-body {
+    padding: 12px 16px;
+    border-top: 1px solid #f0f0f0;
+    background: #fff;
+
+    .pdf-fold-toolbar-inline {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding: 8px 12px;
+      background: #f5f7fa;
+      border-radius: 6px;
+
+      .selected-count {
+        font-size: 12px;
+        color: #606266;
+      }
+
+      .import-controls-inline {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 1;
+      }
+    }
+
+    .pdf-pages-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 12px;
+
+      .pdf-page-thumb {
+        position: relative;
+        border: 1px solid #e4e7ed;
+        border-radius: 6px;
+        overflow: hidden;
+        background: #fff;
+        transition: all 0.2s;
+
+        &:hover {
+          border-color: #409eff;
+          box-shadow: 0 2px 8px rgba(64, 158, 255, 0.2);
+        }
+
+        &.is-imported {
+          background: #f0f9eb;
+          border-color: #67c23a;
+        }
+
+        &.is-selected {
+          border-color: #409eff;
+          box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.3);
+        }
+
+        .thumb-select {
+          position: absolute;
+          top: 4px;
+          left: 4px;
+          z-index: 3;
+          background: rgba(255, 255, 255, 0.9);
+          border-radius: 4px;
+          padding: 2px;
+          :deep(.el-checkbox) {
+            display: block;
+            --el-checkbox-size: 14px;
+            .el-checkbox__inner {
+              width: 16px;
+              height: 16px;
+            }
+          }
+        }
+
+        .thumb-image {
+          position: relative;
+          height: 120px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #f5f7fa;
+          cursor: pointer;
+          overflow: hidden;
+
+          img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+          }
+
+          .thumb-imported-badge {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+          }
+        }
+
+        .thumb-info {
+          padding: 6px 8px;
+          border-top: 1px solid #f0f0f0;
+
+          .thumb-filename {
+            font-size: 11px;
+            color: #909399;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            display: block;
+          }
+        }
+
+        .thumb-actions {
+          display: flex;
+          justify-content: center;
+          gap: 4px;
+          padding: 4px 8px 6px;
+          border-top: 1px solid #f0f0f0;
+        }
+      }
+    }
+  }
+
+  // 列表视图
+  .pdf-list-view {
+    margin-bottom: 12px;
+  }
+
+  .pdf-list-view-inner {
+    margin-bottom: 8px;
+  }
+
+  // 导入操作栏
+  .pdf-import-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: #ecf5ff;
+    border-radius: 6px;
+    margin-bottom: 12px;
+
+    .selected-count {
+      font-size: 13px;
+      color: #409eff;
+      font-weight: 500;
+    }
+
+    .import-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+    }
+  }
+
+  // 已导入列表
+  .pdf-imported-list {
+    border: 1px solid #e4e7ed;
+    border-radius: 6px;
+    overflow: hidden;
+
+    .imported-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 12px;
+      background: #f5f7fa;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: #606266;
+      user-select: none;
+
+      &:hover {
+        background: #ebeef5;
+      }
+    }
+
+    .imported-items {
+      padding: 8px 12px;
+      background: #fff;
+    }
+
+    .imported-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 0;
+      border-bottom: 1px dashed #f0f0f0;
+      font-size: 13px;
+
+      &:last-child {
+        border-bottom: none;
+      }
+
+      .imported-icon {
+        color: #909399;
+      }
+
+      .imported-filename {
+        color: #606266;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .imported-arrow {
+        color: #c0c4cc;
+      }
+
+      .imported-actions {
+        display: flex;
+        gap: 4px;
+        flex-shrink: 0;
+      }
+    }
+  }
+}
+
+/* 待转换 PDF 列表 */
+.uploaded-pdfs {
+  margin-top: 16px;
+
+  .pdf-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #fff;
+    border: 1px solid #e4e7ed;
+    border-radius: 6px;
+    margin-bottom: 8px;
+
+    .pdf-name {
+      flex: 1;
+      font-size: 13px;
+      color: #606266;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .pdf-size {
+      font-size: 12px;
+      color: #909399;
+    }
+  }
+}
+
+/* 已转换 PDF 列表 */
+.converted-pdfs {
+  margin-top: 16px;
+
+  .pdf-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #f0f9eb;
+    border: 1px solid #67c23a;
+    border-radius: 6px;
+    margin-bottom: 8px;
+
+    .pdf-name {
+      flex: 1;
+      font-size: 13px;
+      color: #606266;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+}
+
 /* 上传面板 */
 .upload-panel {
   .material-category {
@@ -2215,6 +3745,35 @@ watch(showAddImagingDialog, (val) => {
     color: #606266;
     min-width: 50px;
     text-align: center;
+  }
+}
+
+/* PDF 查看器控制栏 */
+.pdf-viewer-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border-top: 1px solid #ebeef5;
+  background: #f5f7fa;
+  border-radius: 0 0 8px 8px;
+
+  .zoom-controls {
+    border-top: none;
+    padding: 0;
+  }
+
+  .import-controls-inline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .imported-status {
+    display: flex;
+    align-items: center;
+    gap: 12px;
   }
 }
 

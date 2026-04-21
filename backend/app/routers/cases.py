@@ -2,12 +2,17 @@
 案件管理路由
 """
 import os
+import threading
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from app.database import get_db
 from app.models.case import Case, CaseStatus, MaterialType, MaterialGroup, Person, Material, OcrStatus
+
+# 停止请求存储：key=case_id, value="stop"(等当前完)|"force"(强制立刻停)
+_stop_flags: dict[int, str] = {}
+_flags_lock = threading.Lock()
 from app.schemas.case import (
     CaseCreate, CaseUpdate, CaseResponse, CaseListResponse, PersonResponse,
     MaterialGroupResponse
@@ -321,6 +326,51 @@ def start_recognition(case_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"OCR识别失败: {str(e)}")
 
 
+@router.post("/{case_id}/stop-recognize")
+def stop_recognize(case_id: int, db: Session = Depends(get_db)):
+    """停止识别（等当前这张识别完再停，剩余材料保持 pending）"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    with _flags_lock:
+        _stop_flags[case_id] = "stop"
+    return {"message": "已发出停止请求，当前这张识别完后将停止", "case_id": case_id}
+
+
+@router.post("/{case_id}/force-stop-recognize")
+def force_stop_recognize(case_id: int, db: Session = Depends(get_db)):
+    """强制停止识别（立刻中断，不等当前这张）"""
+    import sys
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    with _flags_lock:
+        _stop_flags[case_id] = "force"
+    # 将未完成的材料状态重置为 pending
+    for m in case.materials:
+        if m.ocr_status in (OcrStatus.PROCESSING, OcrStatus.PENDING):
+            m.ocr_status = OcrStatus.PENDING
+    if case.status == CaseStatus.RECOGNIZING:
+        case.status = CaseStatus.PENDING_UPLOAD
+    db.commit()
+    return {"message": "已强制停止，进程将立刻中断", "case_id": case_id}
+
+
+@router.get("/{case_id}/recognize-status")
+def get_recognize_status(case_id: int, db: Session = Depends(get_db)):
+    """查询当前识别状态和停止请求状态"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    with _flags_lock:
+        stop_flag = _stop_flags.get(case_id, None)
+    return {
+        "case_id": case_id,
+        "case_status": str(case.status) if case.status else None,
+        "stop_requested": stop_flag,
+    }
+
+
 @router.post("/{case_id}/recognize-all")
 def recognize_all_pending(case_id: int, db: Session = Depends(get_db)):
     """批量 OCR 识别所有待识别材料（不改变案件状态，支持增量识别）"""
@@ -337,8 +387,23 @@ def recognize_all_pending(case_id: int, db: Session = Depends(get_db)):
 
         save_dir = os.path.join(str(settings.UPLOAD_DIR), str(case_id), "ocr_result")
         results = []
+        stopped = False
+        stop_type = None
 
         for mat in pending_materials:
+            # 检查强制停止（立刻退出）
+            with _flags_lock:
+                flag = _stop_flags.get(case_id, None)
+            if flag == "force":
+                # 将当前 PROCESSING 的材料重置为 PENDING
+                if mat.ocr_status == OcrStatus.PROCESSING:
+                    mat.ocr_status = OcrStatus.PENDING
+                    mat.ocr_text = ""
+                stopped = True
+                stop_type = "force"
+                db.commit()
+                break
+
             if not mat.file_path or not os.path.exists(mat.file_path):
                 mat.ocr_status = OcrStatus.FAILED
                 mat.ocr_text = "文件不存在"
@@ -368,7 +433,29 @@ def recognize_all_pending(case_id: int, db: Session = Depends(get_db)):
                 mat.ocr_status = OcrStatus.FAILED
                 results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "failed", "error": str(e)})
 
-            db.commit()
+            # 当前这张识别完后，检查是否请求了停止
+            with _flags_lock:
+                flag = _stop_flags.get(case_id, None)
+            if flag == "stop":
+                stopped = True
+                stop_type = "stop"
+                db.commit()
+                break
+
+        # 清理停止标记
+        with _flags_lock:
+            _stop_flags.pop(case_id, None)
+
+        completed = sum(1 for r in results if r["status"] == "completed")
+        failed = sum(1 for r in results if r["status"] == "failed")
+
+        if stopped:
+            return {
+                "message": f"已停止识别（{stop_type == 'force' and '强制' or '正常'}停止），已完成 {completed} 张，失败 {failed} 张",
+                "status": "stopped",
+                "stop_type": stop_type,
+                "results": results,
+            }
 
         return {
             "message": f"识别完成，共处理 {len(results)} 份材料",

@@ -34,6 +34,9 @@ export default {
   startRecognition: (id) => api.post(`/cases/${id}/start-recognition`),
   recognizeSingle: (caseId, materialId) => api.post(`/cases/${caseId}/materials/${materialId}/recognize`),
   recognizeAll: (id) => api.post(`/cases/${id}/recognize-all`),
+  stopRecognize: (id) => api.post(`/cases/${id}/stop-recognize`),
+  forceStopRecognize: (id) => api.post(`/cases/${id}/force-stop-recognize`),
+  getRecognizeStatus: (id) => api.get(`/cases/${id}/recognize-status`),
   submitReview: (id) => api.post(`/cases/${id}/submit-review`),
   confirmCase: (id) => api.post(`/cases/${id}/confirm`),
   reopenCase: (id) => api.post(`/cases/${id}/reopen`),
@@ -78,6 +81,20 @@ export default {
   },
   updateMaterialGroup: (groupId, data) => api.put(`/materials/groups/${groupId}`, data),
   deleteMaterialGroup: (groupId) => api.delete(`/materials/groups/${groupId}`),
+
+  // ===== PDF 转换 =====
+  uploadPdf: (caseId, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return api.post(`/materials/upload-pdf/${caseId}`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+  },
+  getPdfPages: (caseId) => api.get(`/materials/case/${caseId}/pdf-pages`),
+  deletePdfPage: (caseId, filename) => api.delete(`/materials/pdf-page/${caseId}/${encodeURIComponent(filename)}`),
+  deletePdf: (caseId, prefix) => api.delete(`/materials/pdf/${caseId}/${encodeURIComponent(prefix)}`),
+  importPdfPages: (caseId, data) => api.post(`/materials/import-pdf-pages/${caseId}`, data),
+  revertPdfImport: (caseId, filename) => api.post(`/materials/revert-import/${caseId}/${encodeURIComponent(filename)}`),
 
   // ===== 被鉴定人 =====
   getPerson: (caseId) => api.get(`/persons/case/${caseId}`),
