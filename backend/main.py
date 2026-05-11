@@ -91,10 +91,10 @@ app.include_router(settings.router)
 @app.on_event("startup")
 def startup():
     init_db()
-    # 自动修复：将孤立的 PROCESSING 状态重置为 PENDING（后端重启后残留的状态）
+    # 自动修复：将孤立的 PROCESSING/RECOGNIZING 状态重置（后端重启后后台任务不再存在）
     try:
         from app.database import SessionLocal
-        from app.models.case import Material, OcrStatus
+        from app.models.case import Case, CaseStatus, Material, OcrStatus
         db = SessionLocal()
         orphaned = db.query(Material).filter(Material.ocr_status == OcrStatus.PROCESSING).all()
         if orphaned:
@@ -103,9 +103,15 @@ def startup():
                 m.ocr_text = ""
             db.commit()
             logger.info(f"启动修复：{len(orphaned)} 个 PROCESSING 材料已重置为 PENDING")
+        recognizing_cases = db.query(Case).filter(Case.status == CaseStatus.RECOGNIZING).all()
+        if recognizing_cases:
+            for c in recognizing_cases:
+                c.status = CaseStatus.PENDING_UPLOAD
+            db.commit()
+            logger.info(f"启动修复：{len(recognizing_cases)} 个 RECOGNIZING 案件已重置为 PENDING_UPLOAD")
         db.close()
     except Exception as e:
-        logger.warning(f"启动修复 PROCESSING 状态时出错: {e}")
+        logger.warning(f"启动修复识别状态时出错: {e}")
 
 
 # ==================== 前端静态文件托管 ====================
@@ -188,3 +194,14 @@ def get_logs(lines: int = 100, level: str = None):
         "total": len(recent),
         "log_file": log_file,
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=settings.API_HOST,
+        port=settings.API_PORT,
+        reload=False,
+    )

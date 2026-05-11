@@ -32,6 +32,7 @@ class MaterialTypeEnum:
     ID_CARD = "id_card"
     TRAFFIC_ACCIDENT_CERT = "traffic_accident_cert"
     APPRAISAL_APPLICATION = "appraisal_application"
+    LITIGATION_MATERIAL = "litigation_material"
     MEDICAL_RECORD = "medical_record"
     IMAGING_REPORT = "imaging_report"
 
@@ -40,6 +41,7 @@ class MaterialTypeEnum:
         "id_card": "身份证复印件",
         "traffic_accident_cert": "道路交通事故认定书",
         "appraisal_application": "鉴定申请书",
+        "litigation_material": "诉讼材料",
         "medical_record": "医院病历",
         "imaging_report": "影像学报告",
     }

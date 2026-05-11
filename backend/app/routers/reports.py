@@ -66,8 +66,17 @@ def update_report(report_id: int, data: ReportUpdate, db: Session = Depends(get_
             confirmed.add(key)
     report.confirmed_fields = _json.dumps(list(confirmed), ensure_ascii=False)
 
+    edited_report_fields = any(key in report_editable_fields for key in update_data)
+
     for key, value in update_data.items():
         setattr(report, key, value)
+
+    if (
+        edited_report_fields
+        and report.case
+        and report.case.status in (CaseStatus.PENDING_REVIEW, CaseStatus.PENDING_CONFIRM)
+    ):
+        report.case.status = CaseStatus.REVIEWING
 
     report.updated_at = datetime.now()
     db.commit()

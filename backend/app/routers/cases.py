@@ -3,16 +3,21 @@
 """
 import os
 import threading
+import time
+import logging
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.models.case import Case, CaseStatus, MaterialType, MaterialGroup, Person, Material, OcrStatus
 
 # 停止请求存储：key=case_id, value="stop"(等当前完)|"force"(强制立刻停)
 _stop_flags: dict[int, str] = {}
 _flags_lock = threading.Lock()
+_ocr_tasks: dict[int, dict] = {}
+_tasks_lock = threading.Lock()
 from app.schemas.case import (
     CaseCreate, CaseUpdate, CaseResponse, CaseListResponse, PersonResponse,
     MaterialGroupResponse
@@ -21,6 +26,7 @@ from app.utils.ocr import run_ocr, extract_text_from_result
 from app.config import settings
 
 router = APIRouter(prefix="/api/cases", tags=["案件管理"])
+logger = logging.getLogger(__name__)
 
 
 def get_status_label(status: str) -> str:
@@ -29,6 +35,254 @@ def get_status_label(status: str) -> str:
 
 def get_material_type_label(material_type: str) -> str:
     return MaterialType.LABELS.get(material_type, material_type)
+
+
+def _material_counts(db: Session, case_id: int) -> dict:
+    materials = db.query(Material).filter(Material.case_id == case_id).all()
+    return {
+        "total": len(materials),
+        "pending": sum(1 for m in materials if m.ocr_status == OcrStatus.PENDING),
+        "processing": sum(1 for m in materials if m.ocr_status == OcrStatus.PROCESSING),
+        "completed": sum(1 for m in materials if m.ocr_status == OcrStatus.COMPLETED),
+        "failed": sum(1 for m in materials if m.ocr_status == OcrStatus.FAILED),
+    }
+
+
+def _public_task_snapshot(case_id: int, db: Session = None) -> Optional[dict]:
+    with _tasks_lock:
+        task = _ocr_tasks.get(case_id)
+        snapshot = dict(task) if task else None
+    if snapshot and db:
+        snapshot["counts"] = _material_counts(db, case_id)
+    return snapshot
+
+
+def _update_task(case_id: int, **updates) -> None:
+    with _tasks_lock:
+        task = _ocr_tasks.get(case_id)
+        if task:
+            task.update(updates)
+
+
+def _append_task_result(case_id: int, result: dict) -> None:
+    with _tasks_lock:
+        task = _ocr_tasks.get(case_id)
+        if not task:
+            return
+        results = task.setdefault("recent_results", [])
+        results.append(result)
+        if len(results) > 20:
+            del results[:-20]
+
+
+def _finish_task(case_id: int, **updates) -> None:
+    updates.setdefault("finished_at", datetime.now().isoformat(timespec="seconds"))
+    updates.setdefault("current_material_id", None)
+    updates.setdefault("current_filename", None)
+    _update_task(case_id, **updates)
+
+
+def _run_ocr_task(case_id: int, material_ids: List[int], task_id: str) -> None:
+    db = SessionLocal()
+    stopped = False
+    stop_type = None
+    try:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if not case:
+            _finish_task(case_id, status="failed", message="案件不存在")
+            return
+
+        case.status = CaseStatus.RECOGNIZING
+        db.commit()
+
+        save_dir = os.path.join(str(settings.UPLOAD_DIR), str(case_id), "ocr_result")
+        for material_id in material_ids:
+            with _flags_lock:
+                flag = _stop_flags.get(case_id)
+            if flag == "force":
+                stopped = True
+                stop_type = "force"
+                break
+
+            material = db.query(Material).filter(
+                Material.id == material_id,
+                Material.case_id == case_id,
+            ).first()
+            if not material:
+                continue
+
+            _update_task(
+                case_id,
+                current_material_id=material.id,
+                current_filename=material.original_filename,
+                message=f"正在识别 {material.original_filename or material.id}",
+            )
+
+            if not material.file_path or not os.path.exists(material.file_path):
+                material.ocr_status = OcrStatus.FAILED
+                material.ocr_text = "文件不存在"
+                db.commit()
+                _append_task_result(case_id, {
+                    "material_id": material.id,
+                    "filename": material.original_filename,
+                    "status": "failed",
+                    "error": "文件不存在",
+                })
+                _increment_task_progress(case_id, failed=1)
+                continue
+
+            material.ocr_status = OcrStatus.PROCESSING
+            db.commit()
+
+            try:
+                result = run_ocr(material.file_path, save_dir=save_dir)
+                text = extract_text_from_result(result)
+
+                with _flags_lock:
+                    flag = _stop_flags.get(case_id)
+                if flag == "force":
+                    material.ocr_status = OcrStatus.PENDING
+                    material.ocr_text = ""
+                    db.commit()
+                    stopped = True
+                    stop_type = "force"
+                    break
+
+                if text:
+                    material.ocr_text = text
+                    material.ocr_status = OcrStatus.COMPLETED
+                    if result.get("md_path"):
+                        material.ocr_file_path = result["md_path"]
+                    db.commit()
+                    _append_task_result(case_id, {
+                        "material_id": material.id,
+                        "filename": material.original_filename,
+                        "status": "completed",
+                        "text_length": len(text),
+                    })
+                    _increment_task_progress(case_id, completed=1)
+                else:
+                    material.ocr_text = ""
+                    material.ocr_status = OcrStatus.FAILED
+                    db.commit()
+                    _append_task_result(case_id, {
+                        "material_id": material.id,
+                        "filename": material.original_filename,
+                        "status": "failed",
+                        "error": result.get("error", "无识别结果"),
+                    })
+                    _increment_task_progress(case_id, failed=1)
+            except Exception as e:
+                logger.exception("OCR 后台任务识别材料失败: case_id=%s material_id=%s", case_id, material.id)
+                material.ocr_text = f"OCR错误: {str(e)}"
+                material.ocr_status = OcrStatus.FAILED
+                db.commit()
+                _append_task_result(case_id, {
+                    "material_id": material.id,
+                    "filename": material.original_filename,
+                    "status": "failed",
+                    "error": str(e),
+                })
+                _increment_task_progress(case_id, failed=1)
+
+            with _flags_lock:
+                flag = _stop_flags.get(case_id)
+            if flag == "stop":
+                stopped = True
+                stop_type = "stop"
+                break
+
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if case:
+            if stopped:
+                case.status = CaseStatus.PENDING_UPLOAD
+            else:
+                case.status = CaseStatus.PENDING_REVIEW
+            for m in db.query(Material).filter(
+                Material.case_id == case_id,
+                Material.ocr_status == OcrStatus.PROCESSING,
+            ).all():
+                m.ocr_status = OcrStatus.PENDING
+            db.commit()
+
+        with _flags_lock:
+            _stop_flags.pop(case_id, None)
+
+        if stopped:
+            _finish_task(
+                case_id,
+                status="stopped",
+                stop_type=stop_type,
+                message=f"识别已停止（{'强制' if stop_type == 'force' else '正常'}停止）",
+            )
+        else:
+            _finish_task(case_id, status="completed", message="识别完成")
+    except Exception as e:
+        logger.exception("OCR 后台任务失败: case_id=%s task_id=%s", case_id, task_id)
+        try:
+            for m in db.query(Material).filter(
+                Material.case_id == case_id,
+                Material.ocr_status == OcrStatus.PROCESSING,
+            ).all():
+                m.ocr_status = OcrStatus.PENDING
+            case = db.query(Case).filter(Case.id == case_id).first()
+            if case and case.status == CaseStatus.RECOGNIZING:
+                case.status = CaseStatus.PENDING_UPLOAD
+            db.commit()
+        except Exception:
+            db.rollback()
+        _finish_task(case_id, status="failed", message=f"OCR任务失败: {str(e)}")
+    finally:
+        db.close()
+
+
+def _increment_task_progress(case_id: int, completed: int = 0, failed: int = 0) -> None:
+    with _tasks_lock:
+        task = _ocr_tasks.get(case_id)
+        if not task:
+            return
+        task["processed"] = task.get("processed", 0) + completed + failed
+        task["completed"] = task.get("completed", 0) + completed
+        task["failed"] = task.get("failed", 0) + failed
+
+
+def _start_ocr_background_task(case_id: int, material_ids: List[int], mode: str) -> dict:
+    with _tasks_lock:
+        existing = _ocr_tasks.get(case_id)
+        if existing and existing.get("status") == "running":
+            return dict(existing)
+
+        task_id = f"{case_id}-{int(time.time())}"
+        task = {
+            "task_id": task_id,
+            "case_id": case_id,
+            "mode": mode,
+            "status": "running",
+            "total": len(material_ids),
+            "processed": 0,
+            "completed": 0,
+            "failed": 0,
+            "current_material_id": None,
+            "current_filename": None,
+            "stop_type": None,
+            "message": "识别任务已启动",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "recent_results": [],
+        }
+        _ocr_tasks[case_id] = task
+
+    with _flags_lock:
+        _stop_flags.pop(case_id, None)
+
+    worker = threading.Thread(
+        target=_run_ocr_task,
+        args=(case_id, material_ids, task_id),
+        daemon=True,
+        name=f"ocr-case-{case_id}",
+    )
+    worker.start()
+    return task
 
 
 @router.get("", response_model=List[CaseListResponse])
@@ -165,12 +419,17 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
         case_number=case.case_number,
         entrusting_unit=case.entrusting_unit,
         entrustment_matter=case.entrustment_matter,
+        accident_date=case.accident_date,
+        accident_location=case.accident_location,
+        accident_description=case.accident_description,
         acceptance_date=case.acceptance_date,
         appraisal_date=case.appraisal_date,
         appraisal_location=case.appraisal_location,
         on_site_personnel=case.on_site_personnel,
         material_list=case.material_list,
         person_name=case.person_name,
+        examination_date=case.examination_date,
+        clinical_examination=case.clinical_examination,
         status=case.status,
         status_label=get_status_label(case.status),
         created_at=case.created_at,
@@ -229,8 +488,17 @@ def update_case(case_id: int, data: CaseUpdate, db: Session = Depends(get_db)):
             confirmed.add(key)
     case.confirmed_fields = _json.dumps(list(confirmed), ensure_ascii=False)
 
+    edited_user_fields = any(key in user_editable_fields for key in update_data)
+
     for key, value in update_data.items():
         setattr(case, key, value)
+
+    if (
+        edited_user_fields
+        and "status" not in update_data
+        and case.status in (CaseStatus.PENDING_REVIEW, CaseStatus.PENDING_CONFIRM)
+    ):
+        case.status = CaseStatus.REVIEWING
 
     # 如果 person_name 被更新，直接同步
     # 如果没有显式传 person_name 但 Person 关联存在且 name 不为空，也确保同步
@@ -255,75 +523,22 @@ def delete_case(case_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{case_id}/start-recognition")
 def start_recognition(case_id: int, db: Session = Depends(get_db)):
-    """批量 OCR 识别所有材料（同步执行，硅基流动API每张约3秒）"""
-    import traceback as _tb
-    try:
-        case = db.query(Case).filter(Case.id == case_id).first()
-        if not case:
-            raise HTTPException(status_code=404, detail="案件不存在")
+    """后台批量 OCR 识别所有材料（兼容旧入口）"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    if not case.materials:
+        raise HTTPException(status_code=400, detail="请先上传材料")
 
-        if not case.materials:
-            raise HTTPException(status_code=400, detail="请先上传材料")
-
-        case.status = CaseStatus.RECOGNIZING
-        db.commit()
-
-        save_dir = os.path.join(str(settings.UPLOAD_DIR), str(case_id), "ocr_result")
-        results = []
-
-        for mat in case.materials:
-            if not mat.file_path or not os.path.exists(mat.file_path):
-                mat.ocr_status = OcrStatus.FAILED
-                mat.ocr_text = "文件不存在"
-                db.commit()
-                results.append({"material_id": mat.id, "status": "failed", "error": "文件不存在"})
-                continue
-
-            mat.ocr_status = OcrStatus.PROCESSING
-            db.commit()
-
-            try:
-                result = run_ocr(mat.file_path, save_dir=save_dir)
-                text = extract_text_from_result(result)
-
-                if text:
-                    mat.ocr_text = text
-                    mat.ocr_status = OcrStatus.COMPLETED
-                    if result.get("md_path"):
-                        mat.ocr_file_path = result["md_path"]
-                    results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "completed", "text_length": len(text)})
-                else:
-                    mat.ocr_text = ""
-                    mat.ocr_status = OcrStatus.FAILED
-                    results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "failed", "error": result.get("error", "无识别结果")})
-            except Exception as e:
-                mat.ocr_text = f"OCR错误: {str(e)}"
-                mat.ocr_status = OcrStatus.FAILED
-                results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "failed", "error": str(e)})
-
-            db.commit()
-
-        # 识别完成，案件状态改为"待修正"
-        case.status = CaseStatus.PENDING_REVIEW
-        db.commit()
-
-        return {
-            "message": f"识别完成，共 {len(results)} 份材料",
-            "status": "completed",
-            "results": results
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        _tb.print_exc()
-        try:
-            case = db.query(Case).filter(Case.id == case_id).first()
-            if case and case.status == CaseStatus.RECOGNIZING:
-                case.status = CaseStatus.PENDING_UPLOAD
-                db.commit()
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"OCR识别失败: {str(e)}")
+    material_ids = [m.id for m in case.materials]
+    case.status = CaseStatus.RECOGNIZING
+    db.commit()
+    task = _start_ocr_background_task(case_id, material_ids, mode="all")
+    return {
+        "message": f"已开始后台识别，共 {len(material_ids)} 张材料",
+        "status": task["status"],
+        "task": _public_task_snapshot(case_id, db),
+    }
 
 
 @router.post("/{case_id}/stop-recognize")
@@ -334,6 +549,7 @@ def stop_recognize(case_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="案件不存在")
     with _flags_lock:
         _stop_flags[case_id] = "stop"
+    _update_task(case_id, message="已请求停止，当前材料完成后停止")
     return {"message": "已发出停止请求，当前这张识别完后将停止", "case_id": case_id}
 
 
@@ -346,6 +562,7 @@ def force_stop_recognize(case_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="案件不存在")
     with _flags_lock:
         _stop_flags[case_id] = "force"
+    _update_task(case_id, message="已请求强制停止，正在收尾")
     # 将未完成的材料状态重置为 pending
     for m in case.materials:
         if m.ocr_status in (OcrStatus.PROCESSING, OcrStatus.PENDING):
@@ -368,105 +585,31 @@ def get_recognize_status(case_id: int, db: Session = Depends(get_db)):
         "case_id": case_id,
         "case_status": str(case.status) if case.status else None,
         "stop_requested": stop_flag,
+        "task": _public_task_snapshot(case_id, db),
+        "counts": _material_counts(db, case_id),
     }
 
 
 @router.post("/{case_id}/recognize-all")
 def recognize_all_pending(case_id: int, db: Session = Depends(get_db)):
-    """批量 OCR 识别所有待识别材料（不改变案件状态，支持增量识别）"""
-    import traceback as _tb
-    try:
-        case = db.query(Case).filter(Case.id == case_id).first()
-        if not case:
-            raise HTTPException(status_code=404, detail="案件不存在")
+    """后台批量 OCR 识别所有待识别材料（支持增量识别）"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
 
-        # 只识别 pending 和 failed 状态的材料
-        pending_materials = [m for m in case.materials if m.ocr_status in (OcrStatus.PENDING, OcrStatus.FAILED)]
-        if not pending_materials:
-            return {"message": "没有待识别的材料", "status": "skipped", "results": []}
+    pending_materials = [m for m in case.materials if m.ocr_status in (OcrStatus.PENDING, OcrStatus.FAILED)]
+    if not pending_materials:
+        return {"message": "没有待识别的材料", "status": "skipped", "task": None, "counts": _material_counts(db, case_id)}
 
-        save_dir = os.path.join(str(settings.UPLOAD_DIR), str(case_id), "ocr_result")
-        results = []
-        stopped = False
-        stop_type = None
-
-        for mat in pending_materials:
-            # 检查强制停止（立刻退出）
-            with _flags_lock:
-                flag = _stop_flags.get(case_id, None)
-            if flag == "force":
-                # 将当前 PROCESSING 的材料重置为 PENDING
-                if mat.ocr_status == OcrStatus.PROCESSING:
-                    mat.ocr_status = OcrStatus.PENDING
-                    mat.ocr_text = ""
-                stopped = True
-                stop_type = "force"
-                db.commit()
-                break
-
-            if not mat.file_path or not os.path.exists(mat.file_path):
-                mat.ocr_status = OcrStatus.FAILED
-                mat.ocr_text = "文件不存在"
-                db.commit()
-                results.append({"material_id": mat.id, "status": "failed", "error": "文件不存在"})
-                continue
-
-            mat.ocr_status = OcrStatus.PROCESSING
-            db.commit()
-
-            try:
-                result = run_ocr(mat.file_path, save_dir=save_dir)
-                text = extract_text_from_result(result)
-
-                if text:
-                    mat.ocr_text = text
-                    mat.ocr_status = OcrStatus.COMPLETED
-                    if result.get("md_path"):
-                        mat.ocr_file_path = result["md_path"]
-                    results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "completed", "text_length": len(text)})
-                else:
-                    mat.ocr_text = ""
-                    mat.ocr_status = OcrStatus.FAILED
-                    results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "failed", "error": result.get("error", "无识别结果")})
-            except Exception as e:
-                mat.ocr_text = f"OCR错误: {str(e)}"
-                mat.ocr_status = OcrStatus.FAILED
-                results.append({"material_id": mat.id, "filename": mat.original_filename, "status": "failed", "error": str(e)})
-
-            # 当前这张识别完后，检查是否请求了停止
-            with _flags_lock:
-                flag = _stop_flags.get(case_id, None)
-            if flag == "stop":
-                stopped = True
-                stop_type = "stop"
-                db.commit()
-                break
-
-        # 清理停止标记
-        with _flags_lock:
-            _stop_flags.pop(case_id, None)
-
-        completed = sum(1 for r in results if r["status"] == "completed")
-        failed = sum(1 for r in results if r["status"] == "failed")
-
-        if stopped:
-            return {
-                "message": f"已停止识别（{stop_type == 'force' and '强制' or '正常'}停止），已完成 {completed} 张，失败 {failed} 张",
-                "status": "stopped",
-                "stop_type": stop_type,
-                "results": results,
-            }
-
-        return {
-            "message": f"识别完成，共处理 {len(results)} 份材料",
-            "status": "completed",
-            "results": results
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        _tb.print_exc()
-        raise HTTPException(status_code=500, detail=f"OCR识别失败: {str(e)}")
+    case.status = CaseStatus.RECOGNIZING
+    db.commit()
+    material_ids = [m.id for m in pending_materials]
+    task = _start_ocr_background_task(case_id, material_ids, mode="pending")
+    return {
+        "message": f"已开始后台识别，共 {len(material_ids)} 张待识别材料",
+        "status": task["status"],
+        "task": _public_task_snapshot(case_id, db),
+    }
 
 
 @router.post("/{case_id}/materials/{material_id}/recognize")

@@ -36,6 +36,7 @@ export const MATERIAL_TYPES = {
   id_card: '身份证复印件',
   traffic_accident_cert: '道路交通事故认定书',
   appraisal_application: '鉴定申请书',
+  litigation_material: '诉讼材料',
   medical_record: '医院病历',
   imaging_report: '影像学报告',
 }

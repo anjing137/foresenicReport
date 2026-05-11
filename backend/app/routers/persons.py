@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.case import Case, Person
+from app.models.case import Case, CaseStatus, Person
 from app.schemas.case import PersonCreate, PersonUpdate, PersonResponse
 
 router = APIRouter(prefix="/api/persons", tags=["被鉴定人"])
@@ -94,6 +94,8 @@ def update_person_by_case(case_id: int, data: PersonUpdate, db: Session = Depend
     # 同步 person_name
     if data.name:
         case.person_name = data.name
+    if case.status in (CaseStatus.PENDING_REVIEW, CaseStatus.PENDING_CONFIRM):
+        case.status = CaseStatus.REVIEWING
 
     db.commit()
     db.refresh(case.person)

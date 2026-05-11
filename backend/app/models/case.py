@@ -36,17 +36,19 @@ class MaterialType:
     ID_CARD = "id_card"                                  # 身份证复印件
     TRAFFIC_ACCIDENT_CERT = "traffic_accident_cert"      # 道路交通事故认定书
     APPRAISAL_APPLICATION = "appraisal_application"       # 鉴定申请书
+    LITIGATION_MATERIAL = "litigation_material"          # 诉讼材料（起诉状、答辩状等）
     MEDICAL_RECORD = "medical_record"                    # 医院病历
     IMAGING_REPORT = "imaging_report"                    # 影像学报告
 
     ALL = [ENTRUSTMENT_LETTER, ID_CARD, TRAFFIC_ACCIDENT_CERT,
-           APPRAISAL_APPLICATION, MEDICAL_RECORD, IMAGING_REPORT]
+           APPRAISAL_APPLICATION, LITIGATION_MATERIAL, MEDICAL_RECORD, IMAGING_REPORT]
 
     LABELS = {
         ENTRUSTMENT_LETTER: "委托书",
         ID_CARD: "身份证复印件",
         TRAFFIC_ACCIDENT_CERT: "道路交通事故认定书",
         APPRAISAL_APPLICATION: "鉴定申请书",
+        LITIGATION_MATERIAL: "诉讼材料",
         MEDICAL_RECORD: "医院病历",
         IMAGING_REPORT: "影像学报告",
     }

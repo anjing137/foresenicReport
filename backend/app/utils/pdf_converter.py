@@ -45,10 +45,12 @@ class PdfConverter:
         # 保存原始 PDF 文件名用于返回
         self._original_pdf_filename = original_filename or os.path.basename(pdf_path)
         # 保存元数据（原始 PDF 文件名）到同名 .json 文件
-        import json
         meta_path = os.path.join(self.output_dir, prefix + "_meta.json")
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump({"original_pdf_filename": self._original_pdf_filename}, f)
+            json.dump({
+                "original_pdf_filename": self._original_pdf_filename,
+                "source_pdf_path": pdf_path,
+            }, f)
 
         try:
             # 执行 pdftoppm 转换

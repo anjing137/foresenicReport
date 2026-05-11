@@ -82,7 +82,7 @@
           </template>
           <el-timeline>
             <el-timeline-item type="primary">1. 创建案件</el-timeline-item>
-            <el-timeline-item type="primary">2. 上传材料（6类）</el-timeline-item>
+            <el-timeline-item type="primary">2. 上传材料（7类）</el-timeline-item>
             <el-timeline-item type="primary">3. OCR识别（可随时追加材料）</el-timeline-item>
             <el-timeline-item type="primary">4. 智能提取 + 修正内容</el-timeline-item>
             <el-timeline-item type="primary">5. 确认鉴定意见</el-timeline-item>

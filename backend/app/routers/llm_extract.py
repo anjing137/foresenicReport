@@ -4,6 +4,7 @@ OCR 识别完成后，调用 LLM 从 OCR 文本中提取结构化字段
 """
 import json
 import logging
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -59,6 +60,156 @@ def _write_report_field(report, field_name: str, value) -> bool:
     return False
 
 
+def _plain_ocr_text(text: str, remove_whitespace: bool = False) -> str:
+    """将 OCR Markdown/HTML 清理为便于规则抽取的纯文本。"""
+    if not text:
+        return ""
+
+    text = text.replace("<nl>", "\n")
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"#+", " ", text)
+
+    if remove_whitespace:
+        return re.sub(r"\s+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clean_extracted_phrase(text: str) -> str:
+    """清理抽出的短语，保留中文标点含义但去掉边界噪声。"""
+    text = _plain_ocr_text(text, remove_whitespace=True)
+    text = re.sub(r"^[：:；;，,。、\s]+", "", text)
+    text = re.sub(r"[；;，,。、\s]+$", "", text)
+    return text
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        value = (value or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _get_person_name(case: Case, db: Session, fallback: str = "") -> str:
+    person = db.query(Person).filter(Person.case_id == case.id).first()
+    return (
+        fallback
+        or (person.name if person and person.name else "")
+        or case.person_name
+        or "被鉴定人"
+    )
+
+
+def _normalize_entrustment_matter(matter: str, person_name: str = "") -> str:
+    """把委托事项统一成可直接接在“特委托我鉴定中心”后的短语。"""
+    matter = _clean_extracted_phrase(matter)
+    person_name = person_name or "被鉴定人"
+
+    if not matter:
+        return f"对{person_name}进行鉴定"
+
+    matter = matter.replace("请求委托鉴定机构", "")
+    matter = matter.replace("请求依法委托鉴定机构", "")
+    matter = matter.replace("请求", "")
+
+    if person_name and person_name != "被鉴定人":
+        matter = re.sub(r"对(?:申请人|被鉴定人|伤者|原告)的", f"对{person_name}的", matter)
+        matter = re.sub(r"对(?:申请人|被鉴定人|伤者|原告)", f"对{person_name}", matter)
+        matter = re.sub(r"(?:申请人|被鉴定人|伤者|原告)的", f"{person_name}的", matter)
+
+    if not matter.startswith("对"):
+        if matter.startswith(person_name):
+            matter = f"对{matter}"
+        elif person_name and person_name != "被鉴定人":
+            matter = f"对{person_name}的{matter}"
+        else:
+            matter = f"对{matter}"
+
+    if not matter.endswith("鉴定"):
+        matter = matter.rstrip("。；;，,、")
+        matter = f"{matter}进行鉴定"
+
+    return matter
+
+
+def _extract_entrustment_requirement(text: str) -> str:
+    """优先从司法鉴定委托书的“鉴定要求/鉴定事项”等字段抽取真正委托事项。"""
+    compact = _plain_ocr_text(text, remove_whitespace=True)
+    if not compact:
+        return ""
+
+    stop_words = (
+        "现将|请根据|鉴定完毕|委托书和相关材料|相关材料移交|"
+        "原阳县人民法院|新乡县人民法院|卫辉市人民法院|获嘉县人民法院|"
+        "督办人|联系电话|联系人|年月日|[0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日"
+    )
+    headings = ["鉴定要求", "鉴定事项", "委托鉴定事项", "委托事项", "鉴定项目"]
+    for heading in headings:
+        match = re.search(rf"{heading}[：:；;]?(.*?)(?=(?:{stop_words}|$))", compact)
+        if match:
+            phrase = _clean_extracted_phrase(match.group(1))
+            # 案由常以“一案”结尾，不应作为委托事项；继续寻找更具体的“鉴定要求”。
+            if phrase and not phrase.endswith("一案"):
+                return phrase
+    return ""
+
+
+def _extract_appraisal_application_items(text: str) -> str:
+    """从鉴定申请书中抽取“申请事项”，仅在委托书缺少鉴定要求时作兜底。"""
+    compact = _plain_ocr_text(text, remove_whitespace=True)
+    if not compact:
+        return ""
+
+    match = re.search(r"申请事项[：:]?(.*?)(?=(?:事实与理由|此致|申请人[：:]|[0-9]{4}年|$))", compact)
+    if not match:
+        return ""
+
+    raw_items = match.group(1)
+    items = re.findall(r"(?:\d+[、.．])(.+?)(?=\d+[、.．]|$)", raw_items)
+    if not items:
+        items = [raw_items]
+
+    cleaned = [_clean_extracted_phrase(item) for item in items]
+    cleaned = [item for item in cleaned if item]
+    return "；".join(cleaned)
+
+
+def _get_treatment_hospitals(case_id: int, db: Session) -> list[str]:
+    """获取基本案情里的就诊医院，结构化病历优先，分组和 OCR 兜底。"""
+    hospitals = []
+
+    records = db.query(HospitalRecord).filter(
+        HospitalRecord.case_id == case_id,
+    ).order_by(HospitalRecord.admission_date).all()
+    hospitals.extend(r.hospital_name for r in records if r.hospital_name)
+
+    groups = db.query(MaterialGroup).filter(
+        MaterialGroup.case_id == case_id,
+        MaterialGroup.material_type == MaterialType.MEDICAL_RECORD,
+    ).order_by(MaterialGroup.sort_order, MaterialGroup.id).all()
+    hospitals.extend(g.group_name for g in groups if g.group_name)
+
+    if not hospitals:
+        materials = db.query(Material).filter(
+            Material.case_id == case_id,
+            Material.material_type == MaterialType.MEDICAL_RECORD,
+            Material.ocr_text.isnot(None),
+            Material.ocr_text != "",
+        ).order_by(Material.page_number, Material.id).limit(8).all()
+        for material in materials:
+            text = _plain_ocr_text(material.ocr_text)
+            hospitals.extend(re.findall(r"[\u4e00-\u9fa5]{2,30}(?:人民医院|中心医院|中医院|医院|卫生院)", text))
+
+    invalid = {"医院", "某医院", "未知医院", "未分组"}
+    return [h for h in _ordered_unique(hospitals) if h not in invalid]
+
+
 @router.post("/cases/{case_id}/extract-all")
 def extract_all_materials(case_id: int, db: Session = Depends(get_db)):
     """
@@ -99,11 +250,13 @@ def extract_all_materials(case_id: int, db: Session = Depends(get_db)):
     # 统计
     success_count = sum(1 for r in results if r.get("status") == "completed")
     failed_count = sum(1 for r in results if r.get("status") == "failed")
+    skipped_count = sum(1 for r in results if r.get("status") == "skipped")
 
     return {
-        "message": f"提取完成：成功 {success_count} 份，失败 {failed_count} 份",
+        "message": f"提取完成：成功 {success_count} 份，跳过 {skipped_count} 份，失败 {failed_count} 份",
         "total": len(results),
         "success": success_count,
+        "skipped": skipped_count,
         "failed": failed_count,
         "results": results,
     }
@@ -797,6 +950,15 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
     material_type = material.material_type
     ocr_text = material.ocr_text
 
+    if material_type == MaterialType.LITIGATION_MATERIAL:
+        return {
+            "material_id": material.id,
+            "filename": material.original_filename,
+            "material_type": material_type,
+            "status": "skipped",
+            "message": "诉讼材料暂作为背景材料保存，不做结构化提取",
+        }
+
     # 调用 LLM 提取
     result = extract_fields(material_type, ocr_text)
 
@@ -817,6 +979,11 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
     if material_type == MaterialType.ENTRUSTMENT_LETTER:
         # 委托书 → 更新 Case 基本情况（已确认字段不覆盖）
         case_confirmed = _get_confirmed_fields(case)
+        person_name = _get_person_name(case, db, fields.get("person_name") or "")
+        requirement = _extract_entrustment_requirement(ocr_text)
+        if requirement:
+            fields["entrustment_matter"] = _normalize_entrustment_matter(requirement, person_name)
+
         if fields.get("entrusting_unit"):
             _safe_setattr(case, "entrusting_unit", fields["entrusting_unit"], case_confirmed)
         if fields.get("entrustment_matter"):
@@ -968,13 +1135,24 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
 
     elif material_type == MaterialType.APPRAISAL_APPLICATION:
         # 鉴定申请书 → 补充委托单位（委托书优先，申请书可补充）
-        # 注意：委托事项只从「司法鉴定委托书」提取，申请书不覆盖
+        # 注意：委托事项优先从「司法鉴定委托书」的鉴定要求提取；申请书仅在委托书缺失时兜底。
         case_confirmed = _get_confirmed_fields(case)
+        person_name = _get_person_name(case, db, fields.get("person_name") or "")
         if fields.get("entrusting_unit"):
             _safe_setattr(case, "entrusting_unit", fields["entrusting_unit"], case_confirmed)
+
+        fallback_items = fields.get("appraisal_items") or _extract_appraisal_application_items(ocr_text)
+        if fallback_items and not case.entrustment_matter:
+            _safe_setattr(
+                case,
+                "entrustment_matter",
+                _normalize_entrustment_matter(fallback_items, person_name),
+                case_confirmed,
+            )
         saved_info = {
             "applicant": fields.get("applicant"),
             "entrusting_unit": fields.get("entrusting_unit"),
+            "appraisal_items": fields.get("appraisal_items"),
             "case_brief": fields.get("case_brief"),
         }
 
@@ -1051,6 +1229,19 @@ def _generate_material_list(case_id: int, case: Case, db) -> None:
     list_items = []
     idx = 1
 
+    litigation_materials = [
+        m for m in all_materials
+        if m.material_type == MaterialType.LITIGATION_MATERIAL
+    ]
+    litigation_text = " ".join(
+        filter(None, [
+            *(m.description or "" for m in litigation_materials),
+            *(m.original_filename or "" for m in litigation_materials),
+            *(m.ocr_text or "" for m in litigation_materials),
+        ])
+    )
+    has_civil_complaint = "民事起诉状" in litigation_text
+
     # 1. 司法鉴定委托书（原件）
     if MaterialType.ENTRUSTMENT_LETTER in uploaded_types:
         list_items.append(f"{idx}. 司法鉴定委托书原件壹份")
@@ -1067,12 +1258,24 @@ def _generate_material_list(case_id: int, case: Case, db) -> None:
         list_items.append(f"{idx}. 道路交通事故认定书复印件壹份")
         idx += 1
 
-    # 4. 鉴定申请书复印件
-    if MaterialType.APPRAISAL_APPLICATION in uploaded_types:
+    # 4. 鉴定申请书与民事起诉状通常合并列入同一项
+    has_appraisal_application = MaterialType.APPRAISAL_APPLICATION in uploaded_types
+    if has_appraisal_application and has_civil_complaint:
+        list_items.append(f"{idx}. 民事起诉状、鉴定申请书复印件各壹份")
+        idx += 1
+    elif has_appraisal_application:
         list_items.append(f"{idx}. 鉴定申请书复印件壹份")
         idx += 1
+    elif has_civil_complaint:
+        list_items.append(f"{idx}. 民事起诉状复印件壹份")
+        idx += 1
 
-    # 5. 住院病历复印件（按医院分组合并，同一家医院多次住院合并为一条）
+    # 5. 其他诉讼材料，作为背景材料单独列入清单
+    if MaterialType.LITIGATION_MATERIAL in uploaded_types and not has_civil_complaint:
+        list_items.append(f"{idx}. 诉讼材料复印件壹份")
+        idx += 1
+
+    # 6. 住院病历复印件（按医院分组合并，同一家医院多次住院合并为一条）
     if hospital_records:
         # 按医院名分组统计住院次数
         hospital_count = {}
@@ -1088,7 +1291,7 @@ def _generate_material_list(case_id: int, case: Case, db) -> None:
         list_items.append(f"{idx}. 住院病历复印件壹份")
         idx += 1
 
-    # 6. 影像学资料（被鉴定人带胶片给法医查看，按检查类型+张数列，不写原件/复印件）
+    # 7. 影像学资料（被鉴定人带胶片给法医查看，按检查类型+张数列，不写原件/复印件）
     if imaging_reports:
         # 按exam_type汇总张数
         exam_type_counts = {}
@@ -1527,8 +1730,8 @@ def extract_case_facts_text(case_id: int, db) -> dict:
 
     基本案情结构：
     1. 事故经过：照抄交通事故认定书中"道路交通事故发生经过"原文
-    2. 就医经过：被鉴定人受伤后被送至XX医院治疗（按住院记录的医院去重排列）
-    3. 委托语句：现为处理案件需要，{委托单位}特委托我鉴定中心{委托事项}。
+    2. 就医经过：XXX伤后就诊于XXXX。
+    3. 委托语句：现为处理案件需要，{委托单位}特委托我鉴定中心{规范化委托事项}。
     """
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
@@ -1544,32 +1747,17 @@ def extract_case_facts_text(case_id: int, db) -> dict:
         parts.append(case.accident_description)
 
     # === 第二段：就医经过 ===
-    hospital_records = db.query(HospitalRecord).filter(
-        HospitalRecord.case_id == case_id,
-    ).order_by(HospitalRecord.admission_date).all()
-
-    if hospital_records:
-        # 按医院名去重，保持顺序
-        seen = set()
-        hospital_names = []
-        for r in hospital_records:
-            name = r.hospital_name or "某医院"
-            if name not in seen:
-                seen.add(name)
-                hospital_names.append(name)
-
+    hospital_names = _get_treatment_hospitals(case_id, db)
+    if hospital_names:
+        hospital_str = "、".join(hospital_names)
         if len(hospital_names) == 1:
-            hospital_str = hospital_names[0]
-        elif len(hospital_names) == 2:
-            hospital_str = f"{hospital_names[0]}和{hospital_names[1]}"
+            parts.append(f"{person_name}伤后就诊于{hospital_str}。")
         else:
-            hospital_str = "、".join(hospital_names[:-1]) + f"和{hospital_names[-1]}"
-
-        parts.append(f"{person_name}受伤后被送至{hospital_str}治疗。")
+            parts.append(f"{person_name}伤后先后就诊于{hospital_str}。")
 
     # === 第三段：委托语句（固定格式） ===
     entrusting_unit = case.entrusting_unit or "委托单位"
-    entrustment_matter = case.entrustment_matter or "进行鉴定"
+    entrustment_matter = _normalize_entrustment_matter(case.entrustment_matter or "", person_name)
     parts.append(f"现为处理案件需要，{entrusting_unit}特委托我鉴定中心{entrustment_matter}。")
 
     case_facts = "".join(parts)

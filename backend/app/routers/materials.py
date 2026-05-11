@@ -4,6 +4,8 @@
 import os
 import re
 import shutil
+import uuid
+import json
 from fastapi import APIRouter, Depends, UploadFile, File, Form, Query, HTTPException, Body
 from sqlalchemy.orm import Session
 from typing import Optional, List
@@ -19,6 +21,82 @@ router = APIRouter(prefix="/api/materials", tags=["材料管理"])
 
 UPLOAD_DIR = str(settings.UPLOAD_DIR)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _clean_filename(filename: Optional[str], fallback: str = "upload") -> str:
+    """保留展示用原始文件名，同时去掉路径片段和空值。"""
+    cleaned = os.path.basename(filename or "").replace("\x00", "").strip()
+    return cleaned or fallback
+
+
+def _storage_filename(original_filename: str) -> str:
+    """生成安全、唯一的落盘文件名，避免重名覆盖和特殊路径。"""
+    stem, ext = os.path.splitext(original_filename)
+    safe_stem = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", stem).strip("._")
+    safe_stem = safe_stem[:80] or "file"
+    safe_ext = re.sub(r"[^A-Za-z0-9.]", "", ext)[:16]
+    return f"{safe_stem}_{uuid.uuid4().hex[:8]}{safe_ext.lower()}"
+
+
+def _pdf_page_filename(filename: str) -> str:
+    """校验并规范 PDF 转换页文件名。"""
+    cleaned = _clean_filename(filename, "")
+    if cleaned != filename or not re.match(r"^case\d+_[A-Za-z0-9]+-\d+\.(png|jpg|jpeg)$", cleaned, re.IGNORECASE):
+        raise HTTPException(400, "无效的 PDF 页面文件名")
+    return cleaned
+
+
+def _ensure_paired_group(case_id: int, material_type: str, group_name: str, db: Session) -> None:
+    paired_type = None
+    if material_type == MaterialType.MEDICAL_RECORD:
+        paired_type = MaterialType.IMAGING_REPORT
+    elif material_type == MaterialType.IMAGING_REPORT:
+        paired_type = MaterialType.MEDICAL_RECORD
+
+    if not paired_type:
+        return
+
+    existing = db.query(MaterialGroup).filter(
+        MaterialGroup.case_id == case_id,
+        MaterialGroup.material_type == paired_type,
+        MaterialGroup.group_name == group_name,
+    ).first()
+    if existing:
+        return
+
+    max_order = db.query(MaterialGroup).filter(
+        MaterialGroup.case_id == case_id,
+        MaterialGroup.material_type == paired_type,
+    ).count()
+    db.add(MaterialGroup(
+        case_id=case_id,
+        material_type=paired_type,
+        group_name=group_name,
+        sort_order=max_order + 1,
+    ))
+
+
+def _resolve_group_id(case_id: int, material_type: str, group_id: Optional[int], db: Session) -> Optional[int]:
+    if group_id is None:
+        return None
+    group = db.query(MaterialGroup).filter(
+        MaterialGroup.id == group_id,
+        MaterialGroup.case_id == case_id,
+    ).first()
+    if not group:
+        raise HTTPException(400, "材料分组不存在")
+    if group.material_type == material_type:
+        return group.id
+
+    paired = db.query(MaterialGroup).filter(
+        MaterialGroup.case_id == case_id,
+        MaterialGroup.material_type == material_type,
+        MaterialGroup.group_name == group.group_name,
+    ).first()
+    if paired:
+        return paired.id
+
+    raise HTTPException(400, "材料分组类型不匹配")
 
 
 def get_material_type_label(t: str) -> str:
@@ -39,6 +117,7 @@ def material_to_response(m: Material) -> MaterialResponse:
         original_filename=m.original_filename,
         ocr_text=m.ocr_text,
         ocr_status=m.ocr_status,
+        ocr_file_path=m.ocr_file_path,
         created_at=m.created_at,
     )
 
@@ -175,11 +254,13 @@ async def upload_material(
     """
     if material_type not in MaterialType.ALL:
         raise HTTPException(400, f"无效的材料类型: {material_type}")
+    group_id = _resolve_group_id(case_id, material_type, group_id, db)
 
     # 保存文件
     case_dir = os.path.join(UPLOAD_DIR, str(case_id))
     os.makedirs(case_dir, exist_ok=True)
-    file_path = os.path.join(case_dir, file.filename)
+    original_filename = _clean_filename(file.filename)
+    file_path = os.path.join(case_dir, _storage_filename(original_filename))
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -202,7 +283,7 @@ async def upload_material(
         description=description,
         page_number=page_number,
         file_path=file_path,
-        original_filename=file.filename,
+        original_filename=original_filename,
         ocr_status=OcrStatus.PENDING,
     )
     db.add(material)
@@ -224,6 +305,7 @@ async def upload_materials_batch(
     """
     if material_type not in MaterialType.ALL:
         raise HTTPException(400, f"无效的材料类型: {material_type}")
+    group_id = _resolve_group_id(case_id, material_type, group_id, db)
 
     case_dir = os.path.join(UPLOAD_DIR, str(case_id))
     os.makedirs(case_dir, exist_ok=True)
@@ -237,7 +319,8 @@ async def upload_materials_batch(
 
     results = []
     for idx, file in enumerate(files):
-        file_path = os.path.join(case_dir, file.filename)
+        original_filename = _clean_filename(file.filename)
+        file_path = os.path.join(case_dir, _storage_filename(original_filename))
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
@@ -251,7 +334,7 @@ async def upload_materials_batch(
             description=description,
             page_number=page_number,
             file_path=file_path,
-            original_filename=file.filename,
+            original_filename=original_filename,
             ocr_status=OcrStatus.PENDING,
         )
         db.add(material)
@@ -300,14 +383,15 @@ def get_case_materials_grouped(case_id: int, db: Session = Depends(get_db)):
         if mt in [MaterialType.MEDICAL_RECORD, MaterialType.IMAGING_REPORT]:
             # 分组类型：按 group 组织
             type_data = []
+            group_ids = {g.id for g in groups}
             for g in groups:
                 group_mats = [m for m in all_mats if m.group_id == g.id]
                 type_data.append({
                     "group": group_to_response(g),
                     "files": [material_to_response(m) for m in sorted(group_mats, key=lambda x: x.page_number or 0)],
                 })
-            # 没分组的孤儿材料
-            orphan_mats = [m for m in all_mats if m.group_id is None]
+            # 没分组或错挂到其他类型分组的孤儿材料，仍要展示，避免 OCR 页漏计
+            orphan_mats = [m for m in all_mats if m.group_id is None or m.group_id not in group_ids]
             if orphan_mats:
                 type_data.insert(0, {
                     "group": None,
@@ -379,15 +463,15 @@ async def upload_and_convert_pdf(
     """
     from app.utils.pdf_converter import PdfConverter
 
-    if not file.filename.lower().endswith(".pdf"):
+    pdf_filename = _clean_filename(file.filename, "upload.pdf")
+    if not pdf_filename.lower().endswith(".pdf"):
         raise HTTPException(400, "只支持 PDF 文件")
 
     # 保存 PDF 文件
     case_dir = os.path.join(UPLOAD_DIR, str(case_id))
     os.makedirs(case_dir, exist_ok=True)
 
-    pdf_filename = file.filename
-    pdf_path = os.path.join(case_dir, pdf_filename)
+    pdf_path = os.path.join(case_dir, _storage_filename(pdf_filename))
 
     with open(pdf_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -462,6 +546,7 @@ def get_pdf_pages(case_id: int, db: Session = Depends(get_db)):
 def delete_pdf_page(case_id: int, filename: str, db: Session = Depends(get_db)):
     """删除 PDF 转换后的单个页面文件"""
     from app.utils.pdf_converter import PdfConverter
+    filename = _pdf_page_filename(filename)
 
     # 检查是否有已导入的 Material
     existing = db.query(Material).filter(
@@ -489,6 +574,8 @@ def delete_pdf_all(case_id: int, prefix: str, db: Session = Depends(get_db)):
     - 同时删除原始 PDF 文件（如果存在）
     """
     from app.utils.pdf_converter import PdfConverter
+    if not re.match(r"^case\d+_[A-Za-z0-9]+$", prefix):
+        raise HTTPException(400, "无效的 PDF 前缀")
 
     converter = PdfConverter(case_id)
 
@@ -502,11 +589,23 @@ def delete_pdf_all(case_id: int, prefix: str, db: Session = Depends(get_db)):
                 deleted_count += 1
 
     # 删除原始 PDF 文件（如果存在）
+    meta_path = os.path.join(converter.output_dir, prefix + "_meta.json")
     pdf_file = os.path.join(UPLOAD_DIR, str(case_id), prefix + ".pdf")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                meta = json.load(mf)
+            source_pdf_path = meta.get("source_pdf_path")
+            if source_pdf_path:
+                pdf_file = source_pdf_path
+        except Exception:
+            pass
     original_pdf_deleted = False
     if os.path.exists(pdf_file):
         os.remove(pdf_file)
         original_pdf_deleted = True
+    if os.path.exists(meta_path):
+        os.remove(meta_path)
 
     return {
         "ok": True,
@@ -537,6 +636,7 @@ def import_pdf_pages(
 
     if material_type not in MaterialType.ALL:
         raise HTTPException(400, f"无效的材料类型: {material_type}")
+    group_id = _resolve_group_id(case_id, material_type, group_id, db)
 
     # 如果需要分组但没有 group_id，先创建分组
     if group_id is None and group_name and material_type in [MaterialType.MEDICAL_RECORD, MaterialType.IMAGING_REPORT]:
@@ -549,6 +649,8 @@ def import_pdf_pages(
 
         if existing:
             group_id = existing.id
+            _ensure_paired_group(case_id, material_type, group_name, db)
+            db.commit()
         else:
             max_order = db.query(MaterialGroup).filter(
                 MaterialGroup.case_id == case_id,
@@ -562,6 +664,7 @@ def import_pdf_pages(
                 sort_order=max_order + 1,
             )
             db.add(new_group)
+            _ensure_paired_group(case_id, material_type, group_name, db)
             db.commit()
             db.refresh(new_group)
             group_id = new_group.id
@@ -572,9 +675,13 @@ def import_pdf_pages(
     # 计算起始页码
     existing_count = 0
     if group_id:
-        existing_count = db.query(Material).filter(Material.group_id == group_id).count()
+        existing_count = db.query(Material).filter(
+            Material.group_id == group_id,
+            Material.material_type == material_type,
+        ).count()
 
     for idx, filename in enumerate(filenames):
+        filename = _pdf_page_filename(filename)
         page_path = os.path.join(converter.output_dir, filename)
 
         if not os.path.exists(page_path):
@@ -629,6 +736,7 @@ def revert_pdf_import(case_id: int, filename: str, db: Session = Depends(get_db)
     """
     撤销 PDF 页面的导入（删除 Material 记录，保留文件）
     """
+    filename = _pdf_page_filename(filename)
     material = db.query(Material).filter(
         Material.case_id == case_id,
         Material.file_path.like(f"%pdf_pages/{filename}")

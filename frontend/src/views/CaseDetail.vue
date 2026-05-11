@@ -483,19 +483,34 @@
                 <el-icon><VideoCamera /></el-icon> 停止识别（等当前张完成）
               </el-button>
               <el-button type="danger" @click="handleForceStopRecognize">
-                <el-icon><Switch /></el-icon> 强制停止（立刻中断）
+                <el-icon><Switch /></el-icon> 强制停止（尽快中断）
               </el-button>
             </template>
             <!-- 非识别中显示开始按钮 -->
             <template v-else>
-              <el-button type="primary" @click="handleRecognizeAll" :disabled="pendingCount === 0">
+              <el-button type="primary" @click="handleRecognizeAll" :disabled="pendingCount === 0 || ocrRunning">
                 <el-icon><VideoCamera /></el-icon> 全部识别（{{ pendingCount }}张待识别）
               </el-button>
             </template>
-            <el-button @click="loadCase" :disabled="ocrRunning">
+            <el-button @click="loadCase">
               <el-icon><Refresh /></el-icon> 刷新状态
             </el-button>
           </div>
+
+          <el-alert
+            v-if="ocrRunning && ocrTask"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px;"
+          >
+            <template #title>
+              后台识别中：已处理 {{ ocrTask.processed || 0 }} / {{ ocrTask.total || 0 }} 张，
+              成功 {{ ocrTask.completed || 0 }} 张，失败 {{ ocrTask.failed || 0 }} 张
+              <span v-if="ocrTask.current_filename">；当前：{{ ocrTask.current_filename }}</span>
+            </template>
+            <el-progress :percentage="ocrProgressPercent" :stroke-width="8" style="margin-top: 8px;" />
+          </el-alert>
 
           <!-- 材料列表 -->
           <el-table :data="allMaterials" empty-text="暂无材料，请先到「上传材料」页上传" size="small" stripe>
@@ -1383,7 +1398,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -1417,6 +1432,8 @@ const uploading = ref(false)
 
 // OCR 状态
 const ocrRunning = ref(false)
+const ocrTask = ref(null)
+const ocrPollTimer = ref(null)
 const recognizingIds = ref(new Set())  // 正在识别的材料ID集合
 
 // LLM 提取状态
@@ -1471,6 +1488,16 @@ const viewingPdfImportGroupId = ref(null)
 const viewingPdfNewGroupName = ref('')
 const importingPdfPage = ref(false)
 const revertingPdfPage = ref(false)
+
+watch(importTargetType, () => {
+  importTargetGroupId.value = null
+  pdfNewGroupName.value = ''
+})
+
+watch(viewingPdfImportType, () => {
+  viewingPdfImportGroupId.value = null
+  viewingPdfNewGroupName.value = ''
+})
 
 // 轻量 Markdown → HTML 渲染（覆盖OCR文本常见格式）
 function renderOcrMarkdown(md) {
@@ -2016,9 +2043,9 @@ async function importViewingPage() {
     await loadPdfPages()
     await loadMaterialsGrouped()
     // 更新对话框中的页面信息
-    const updated = pdfPages.value.find(p => p.filename === viewingPdfPage.value.filename)
-    if (updated) {
-      viewingPdfPage.value = updated
+    const found = findPdfAndPage(viewingPdfPage.value.filename)
+    if (found) {
+      viewingPdfPage.value = found.page
     }
     // 清空
     viewingPdfImportType.value = ''
@@ -2041,9 +2068,9 @@ async function revertViewingPdfPage() {
     await loadPdfPages()
     await loadMaterialsGrouped()
     // 更新对话框中的页面信息
-    const updated = pdfPages.value.find(p => p.filename === viewingPdfPage.value.filename)
-    if (updated) {
-      viewingPdfPage.value = updated
+    const found = findPdfAndPage(viewingPdfPage.value.filename)
+    if (found) {
+      viewingPdfPage.value = found.page
     }
   } catch (e) {
     if (e !== 'cancel') {
@@ -2165,6 +2192,7 @@ const materialCategories = [
   { type: 'id_card', label: '身份证复印件', icon: 'PictureFilled', color: '#67C23A', grouped: false },
   { type: 'traffic_accident_cert', label: '道路交通事故认定书', icon: 'Document', color: '#E6A23C', grouped: false },
   { type: 'appraisal_application', label: '鉴定申请书', icon: 'Notebook', color: '#F56C6C', grouped: false },
+  { type: 'litigation_material', label: '诉讼材料', icon: 'Files', color: '#14B8A6', grouped: false },
   { type: 'medical_record', label: '医院病历', icon: 'FirstAidKit', color: '#909399', grouped: true, groupLabel: '医院' },
   { type: 'imaging_report', label: '影像学报告', icon: 'PictureFilled', color: '#9B59B6', grouped: true, groupLabel: '医院' },
 ]
@@ -2213,6 +2241,12 @@ const pendingCount = computed(() => allMaterials.value.filter(m => m.ocr_status 
 const completedCount = computed(() => allMaterials.value.filter(m => m.ocr_status === 'completed').length)
 
 const failedCount = computed(() => allMaterials.value.filter(m => m.ocr_status === 'failed').length)
+
+const ocrProgressPercent = computed(() => {
+  const total = ocrTask.value?.total || 0
+  if (!total) return 0
+  return Math.min(100, Math.round(((ocrTask.value?.processed || 0) / total) * 100))
+})
 
 // === 材料分组和查询 ===
 function countMaterialsForType(type) {
@@ -2265,6 +2299,14 @@ function ocrStatusTag(status) {
 // === 加载数据 ===
 onMounted(async () => {
   await loadCase()
+  await refreshOcrStatus({ silent: true })
+  if (ocrRunning.value) {
+    startOcrPolling()
+  }
+})
+
+onBeforeUnmount(() => {
+  stopOcrPolling()
 })
 
 async function loadCase() {
@@ -2392,6 +2434,53 @@ async function handleConfirmOpinion() {
 }
 
 // === OCR 操作 ===
+function stopOcrPolling() {
+  if (ocrPollTimer.value) {
+    clearInterval(ocrPollTimer.value)
+    ocrPollTimer.value = null
+  }
+}
+
+function startOcrPolling() {
+  stopOcrPolling()
+  ocrPollTimer.value = setInterval(() => {
+    refreshOcrStatus({ silent: true })
+  }, 3000)
+}
+
+async function refreshOcrStatus({ silent = false } = {}) {
+  try {
+    const wasRunning = ocrRunning.value
+    const status = await api.getRecognizeStatus(caseId)
+    const task = status.task || null
+    ocrTask.value = task
+    ocrRunning.value = task?.status === 'running' || status.case_status === 'recognizing'
+
+    if (ocrRunning.value) {
+      await loadMaterialsGrouped()
+      return status
+    }
+
+    if (wasRunning) {
+      stopOcrPolling()
+      await loadCase()
+      if (!silent && task?.status === 'completed') {
+        ElMessage.success(task.message || 'OCR识别完成')
+      } else if (!silent && task?.status === 'stopped') {
+        ElMessage.warning(task.message || 'OCR识别已停止')
+      } else if (!silent && task?.status === 'failed') {
+        ElMessage.error(task.message || 'OCR识别失败')
+      }
+    }
+    return status
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('刷新识别状态失败')
+    }
+    return null
+  }
+}
+
 async function handleRecognizeSingle(mat) {
   try {
     recognizingIds.value.add(mat.id)
@@ -2416,19 +2505,17 @@ async function handleRecognizeAll() {
   try {
     ocrRunning.value = true
     const result = await api.recognizeAll(caseId)
-    if (result.status === 'stopped') {
-      const completed = result.results?.filter(r => r.status === 'completed').length || 0
-      const failed = result.results?.filter(r => r.status === 'failed').length || 0
-      ElMessage.warning(`识别已停止（${result.stop_type === 'force' ? '强制' : '正常'}），已完成 ${completed} 张，失败 ${failed} 张`)
-    } else {
-      const completed = result.results?.filter(r => r.status === 'completed').length || 0
-      const failed = result.results?.filter(r => r.status === 'failed').length || 0
-      ElMessage.success(`识别完成：${completed}张成功，${failed}张失败`)
+    if (result.status === 'skipped') {
+      ocrRunning.value = false
+      ElMessage.info(result.message || '没有待识别的材料')
+      return
     }
-    await loadCase()
+    ocrTask.value = result.task || null
+    ElMessage.success(result.message || '后台识别已开始')
+    await loadMaterialsGrouped()
+    startOcrPolling()
   } catch (e) {
     ElMessage.error('批量识别失败')
-  } finally {
     ocrRunning.value = false
   }
 }
@@ -2437,6 +2524,8 @@ async function handleStopRecognize() {
   try {
     await api.stopRecognize(caseId)
     ElMessage.info('已发出停止请求，当前张识别完后将停止')
+    await refreshOcrStatus({ silent: true })
+    startOcrPolling()
   } catch (e) {
     ElMessage.error('停止请求失败')
   }
@@ -2445,9 +2534,9 @@ async function handleStopRecognize() {
 async function handleForceStopRecognize() {
   try {
     await api.forceStopRecognize(caseId)
-    ocrRunning.value = false
-    ElMessage.warning('已强制停止，进程已中断')
-    await loadCase()
+    ElMessage.warning('已请求强制停止，正在收尾')
+    await refreshOcrStatus({ silent: true })
+    startOcrPolling()
   } catch (e) {
     ElMessage.error('强制停止失败')
   }

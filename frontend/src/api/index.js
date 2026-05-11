@@ -3,7 +3,7 @@ import { ElMessage } from 'element-plus'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 120000  // OCR/LLM 提取可能需要较长时间
+  timeout: 120000  // 常规 OCR/LLM 请求上限；批量 OCR 会单独放宽
 })
 
 // 请求拦截器
@@ -31,9 +31,9 @@ export default {
   deleteCase: (id) => api.delete(`/cases/${id}`),
   
   // 案件状态操作
-  startRecognition: (id) => api.post(`/cases/${id}/start-recognition`),
-  recognizeSingle: (caseId, materialId) => api.post(`/cases/${caseId}/materials/${materialId}/recognize`),
-  recognizeAll: (id) => api.post(`/cases/${id}/recognize-all`),
+  startRecognition: (id) => api.post(`/cases/${id}/start-recognition`, null, { timeout: 30 * 60 * 1000 }),
+  recognizeSingle: (caseId, materialId) => api.post(`/cases/${caseId}/materials/${materialId}/recognize`, null, { timeout: 300000 }),
+  recognizeAll: (id) => api.post(`/cases/${id}/recognize-all`, null, { timeout: 30 * 60 * 1000 }),
   stopRecognize: (id) => api.post(`/cases/${id}/stop-recognize`),
   forceStopRecognize: (id) => api.post(`/cases/${id}/force-stop-recognize`),
   getRecognizeStatus: (id) => api.get(`/cases/${id}/recognize-status`),
