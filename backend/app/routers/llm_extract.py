@@ -1394,71 +1394,75 @@ def _generate_material_summary(case_id: int, db) -> dict:
 
 
 def _generate_imaging_review(imaging_data: list[dict], person_name: str,
-                              surgery_context: str = "") -> str:
-    """Python 控制格式（日期/医院/换行），LLM 只凝练报告内容为 1-2 句关键发现"""
+                              entrustment: str, summary_context: str) -> str:
+    """一次 LLM 调用：根据委托事项和资料摘要，从检查事实中选相关条目，写法医风格影像复阅"""
     if not imaging_data:
         return ""
 
-    # Python 构建每条的前缀（保持检查事实的原始顺序）
-    prefixes = []
-    raw_contents = []
-    for idx, r in enumerate(imaging_data):
-        hospital = r.get("医院名称") or "某医院"
-        exam_part = r.get("检查部位") or ""
-        exam_type = r.get("检查类型") or ""
-        film_number = r.get("片子编号") or ""
-        date = r.get("报告日期") or ""
-        film_str = f"（号{film_number}）" if film_number else ""
-        prefix = f"复阅{date}{hospital}{person_name}{exam_part}{exam_type}片{film_str}示："
-        prefixes.append(prefix)
-        raw_contents.append({
-            "序号": idx,
-            "原始报告": (r.get("报告内容") or "")[:300],
+    facts = []
+    for r in imaging_data:
+        facts.append({
+            "日期": r.get("报告日期", ""),
+            "医院": r.get("医院名称", ""),
+            "部位": r.get("检查部位", ""),
+            "类型": r.get("检查类型", ""),
+            "片子编号": r.get("片子编号", ""),
+            "报告内容": (r.get("报告内容") or "")[:200],
         })
 
-    # LLM 凝练
-    prompt = f"""你是法医临床学鉴定人。请将以下影像学报告各自凝练为1-2句关键发现。
-{surgery_context}
-要求：
-- findings数组必须与报告列表一一对应，长度相同，不可增减条目
-- 有阳性发现的保留阳性描述，无可凝练内容的填"无特殊发现"
-- 影像诊断与出院诊断矛盾时以出院诊断为准
+    system_prompt = """你是法医临床学鉴定人。根据委托事项和资料摘要，从检查事实中选出相关条目，以真实司法鉴定意见书影像复阅的写法逐条输出。
 
-报告列表：
-{json.dumps(raw_contents, ensure_ascii=False, indent=2)}
+以下是真实鉴定意见书"鉴定过程"中影像复阅部分的写法，请严格参照这种格式和语言风格：
 
-返回JSON，findings数组长度必须为{len(raw_contents)}："""
+【参考样本A——颅脑损伤案件】
+复阅2021年1月7日淇县人民医院杨豫臻颅脑CT平扫片（号CT011566）示：左额部颅骨内板下可见新月形高密度影，双侧额叶可见小片状高密度影，周围见低密度影。大脑纵裂池可见高密度影，余脑实质内未见明显异常密度影。脑室系统未见扩大，脑沟、裂、池未见增宽、加深，中线结构居中。后顶部软组织显示肿胀，其内可见积气影，额骨及顶骨见线样低密度影。
+复阅2021年1月8日淇县人民医院杨豫臻颅脑CT平扫片（号CT011638）示：左额部颅骨内板下可见新月形高密度影，双侧额叶及右侧颞叶可见小片状高密度影，周围可见低密度影。大脑纵裂池可见高密度影，余脑实质内未见明显异常密度影。脑室系统未见扩大，脑沟、裂、池未见增宽、加深，中线结构居中。
+复阅2021年3月8日新乡医学院第一附属医院杨豫臻颅脑CT平扫片（号CT676078）示：颅脑呈术后改变，两侧额部局部骨质缺如，双侧额叶、右侧颞叶见大片状低密度影，边界清晰，余脑实质内未见明显异常密度灶。脑室系统大小、形态如常；脑沟、裂不宽，中线结构居中。
+复阅2021年10月25日新乡医学院第三附属医院杨豫臻颅脑CT平扫片（号CT1272459）示：额骨见透亮线及内固定影，局部骨质局限性缺损，右额部头皮局限性增厚，呈术后改变；双侧额叶、颞叶见大片状低密度影，边界清晰，余脑实质内未见明显异常密度灶。
 
-    result = call_llm_json_harness(
-        task_name="condense_imaging",
-        system_prompt="你是法医临床学鉴定人。只输出JSON。",
+【参考样本B——多发骨折案件】
+复阅2021年4月16日新乡县龙华医院张金遂头颅、胸部CT片（号CT212122）示：右侧额叶见斑点状高密度影，余脑实质未见明显异常密度影，脑沟裂结构未见明显异常，双侧侧脑室后角见高密度影，中线结构居中。左侧锁骨中段见骨质连续性中断，断端错位，并可见碎骨块游离。
+复阅2021年4月29日陆军第八十三集团军医院张金遂左锁骨正位X线片（号90711866）示：左锁骨内固定牢固在位，骨折断端对位对线良好，骨折线模糊。
+复阅2021年8月25日新乡医学院第三附属医院张金遂头颅MRI片（号MR258260）示：右侧额叶见条状长T1长T2信号，FLAIR像呈低信号，周围呈高信号，边界清楚。右侧额叶见斑点状低信号影。印象：右侧额叶软化灶，周围多发含铁血黄素沉积。
+
+注意：每条1-2句只写阳性发现，不写"影像所见""影像诊断"等标签和医师姓名。不相关的检查跳过不写。法医鉴定前最近复查的片子反映了当前状态，必须保留。不要输出思考过程，直接输出复阅行。"""
+
+    prompt = f"""【委托事项】{entrustment}
+【被鉴定人】{person_name}
+【资料摘要】{summary_context}
+
+检查事实：
+{json.dumps(facts, ensure_ascii=False, indent=2)}
+
+逐条输出影像复阅，每条一行，按时间顺序排列。"""
+    result = call_llm_text_harness(
+        task_name="generate_imaging_review",
+        system_prompt=system_prompt,
         instructions=prompt,
-        input_text=json.dumps(raw_contents, ensure_ascii=False),
-        output_schema='{"findings": ["发现1", "发现2"]}',
-        required_fields=["findings"],
         temperature=0.0,
-        max_tokens=3000,
+        max_tokens=4000,
         max_input_chars=12000,
         max_retries=1,
     )
-
-    if result.get("success") and result.get("data", {}).get("findings"):
-        findings = result["data"]["findings"]
-    else:
-        findings = [(r.get("报告内容") or "")[:150] for r in imaging_data]
-
+    if result.get("success"):
+        content = result["content"].strip()
+        lines = [ln.strip() for ln in content.split("\n") if ln.strip().startswith("复阅")]
+        if lines:
+            return "\n".join(lines)
+    # Fallback
     lines = []
-    for i, prefix in enumerate(prefixes):
-        finding = str(findings[i] if i < len(findings) else "").rstrip("。；;，, ").strip()
-        # 跳过无效发现
-        if not finding or finding.lower() in ("none", "null", "无", "未见异常", "无特殊发现"):
-            continue
-        lines.append(f"{prefix}{finding}。")
+    for r in imaging_data:
+        prefix = f"复阅{r.get('报告日期','')}{r.get('医院名称','')}{person_name}{r.get('检查部位','')}{r.get('检查类型','')}片"
+        if r.get("片子编号"):
+            prefix += f"（号{r['片子编号']}）"
+        prefix += "示："
+        lines.append(f"{prefix}{(r.get('报告内容') or '')[:150]}。")
     return "\n".join(lines)
 
 
 def _generate_appraisal_process(case_id: int, db) -> dict:
-    """生成鉴定过程：Python控制影像格式+LLM凝练报告内容；临床检查医生写了直接用，没写LLM推断"""
+    """生成鉴定过程：临床检查医生写了直接用，没写LLM根据最新影像推断；
+    影像复阅一次LLM调用，根据委托事项+资料摘要从检查事实中选相关条目并写法医风格。"""
     img_reports = db.query(ImagingReport).filter(ImagingReport.case_id == case_id).all()
     case = db.query(Case).filter(Case.id == case_id).first()
     person = db.query(Person).filter(Person.case_id == case_id).first()
@@ -1471,44 +1475,40 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
     exam_date = case.examination_date or ""
     clinical_examination = case.clinical_examination or ""
     accident_date = case.accident_date or ""
+    entrustment = case.entrustment_matter or ""
 
-    # 手术/出院诊断为金标准
-    surgery_context = ""
-    if records:
-        diag_parts = []
-        for r in records:
-            if r.discharge_diagnosis:
-                diag_parts.append(f"【{r.hospital_name or '某医院'}出院诊断】{r.discharge_diagnosis}")
-            if r.treatment_process and any(kw in (r.treatment_process or "") for kw in ("手术", "探查", "切除", "修补", "置换", "内固定")):
-                diag_parts.append(f"【{r.hospital_name or '某医院'}手术经过】{(r.treatment_process or '')[:300]}")
-        if diag_parts:
-            surgery_context = f"出院诊断和手术记录为金标准。如影像报告中的诊断与出院诊断不一致，必须以出院诊断为准。\n" + "\n".join(diag_parts)
+    # 资料摘要缩编（出院诊断 + 关键手术经过，600字以内）
+    summary_parts = []
+    for r in records:
+        if r.discharge_diagnosis:
+            summary_parts.append(f"【{r.hospital_name or ''}出院诊断】{r.discharge_diagnosis[:200]}")
+        if r.treatment_process and any(kw in (r.treatment_process or "") for kw in
+                                       ("手术", "探查", "切除", "修补", "置换", "内固定")):
+            summary_parts.append(f"【{r.hospital_name or ''}手术经过】{(r.treatment_process or '')[:300]}")
+    summary_context = "\n".join(summary_parts)[:600]
 
-    # 构建影像数据（粗筛：去血管超声、肌电图、鼻咽喉镜、正常监测类）
+    # 构建影像数据（粗筛去血管超声/肌电/鼻咽喉镜/未完成审核/纯正常）
     _SKIP_TYPES = {"emg_report", "nasopharyngoscopy", "hearing_test", "eeg", "nerve_conduction"}
+    _VASCULAR_KW = ("静脉", "动脉", "动静脉", "血栓", "深静脉", "肌间静脉", "腓静脉")
+    _POSITIVE_KW = ("骨折", "损伤", "出血", "血肿", "断裂", "置换", "术后", "内固定", "缺如", "缺失")
+    _PENDING_KW = ("未完成审核", "尚未上传", "尚未完成", "待审核", "未审核")
+    _NORMAL_KW = ("未见明显异常", "未见异常", "未见明确")
+
     imaging_data = []
     for r in img_reports:
         rtype = (r.exam_type or "").lower().strip()
         ep = (r.exam_part or "").lower()
         rc = (r.report_content or "").lower()
-        # 明确无关检查类型
         if rtype in _SKIP_TYPES:
             continue
-        # 血管多普勒超声/血栓监测（并发症，非事故直接损伤）
-        _vascular_kw = ("静脉", "动脉", "动静脉", "血栓", "深静脉", "肌间静脉", "腓静脉")
-        if any(m in ep for m in _vascular_kw) or any(m in rc[:120] for m in _vascular_kw):
+        if any(m in ep for m in _VASCULAR_KW) or any(m in rc[:120] for m in _VASCULAR_KW):
             continue
-        # 超声/彩超类检查（除脏器超声如肝胆脾胰外，血管监测类跳过）
         if any(m in rtype for m in ("超声", "彩超", "ultrasound")) and \
            not any(m in ep for m in ("肝", "胆", "脾", "胰", "肾", "腹", "心脏", "心")):
             continue
-        # 无诊断意义：报告尚未完成、正常且无阳性发现
-        pending = any(m in rc for m in ("未完成审核", "尚未上传", "尚未完成", "待审核", "未审核"))
-        if pending and not any(m in rc for m in ("骨折", "损伤", "出血", "血肿", "断裂", "置换", "术后", "内固定", "缺如", "缺失")):
+        if any(m in rc for m in _PENDING_KW) and not any(m in rc for m in _POSITIVE_KW):
             continue
-        normal = any(m in rc for m in ("未见明显异常", "未见异常", "未见明确"))
-        positive = any(m in rc for m in ("骨折", "损伤", "出血", "血肿", "断裂", "置换", "术后", "内固定", "缺如", "缺失"))
-        if normal and not positive:
+        if any(m in rc for m in _NORMAL_KW) and not any(m in rc for m in _POSITIVE_KW):
             continue
         imaging_data.append({
             "报告日期": r.report_date or "",
@@ -1519,7 +1519,7 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
             "报告内容": r.report_content or "",
         })
 
-    # 计算伤后时间
+    # 伤后时间
     from datetime import datetime as dt
     time_since = ""
     if accident_date and exam_date:
@@ -1532,15 +1532,13 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
                     time_since = f"伤后{delta}日"
                 else:
                     months = delta // 30
-                    remain = delta % 30
-                    time_since = f"伤后{months}个月余" if remain < 25 else f"伤后{months + 1}个月"
+                    time_since = f"伤后{months}个月余" if delta % 30 < 25 else f"伤后{months + 1}个月"
         except (ValueError, IndexError):
             pass
 
     has_imaging = len(imaging_data) > 0
     has_clinical = bool(clinical_examination.strip())
 
-    # 标准开头
     opening_standard = (
         "按照《法医临床检验规范》（SF/Z JD0103003-2011）和《法医临床影像学检验实施规范》（SF/Z JD0103006-2014）"
         if has_imaging else
@@ -1548,22 +1546,19 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
     )
     opening = f"{opening_standard}对{person_name}进行法医临床学检查。"
 
-    # 日期格式化
     display_date = exam_date
     if exam_date and "-" in exam_date:
         parts_date = exam_date.split(" ")[0].split("-")
         if len(parts_date) == 3:
             display_date = f"{parts_date[0]}年{parts_date[1]}月{parts_date[2]}日"
-
-    # 日期/伤后时间
     date_line = ""
     if display_date or time_since:
         date_part = f"{display_date}，" if display_date else ""
         time_part = f"即被鉴定人{person_name}{time_since}。" if time_since else ""
         date_line = f"{date_part}{time_part}"
 
-    # 影像复阅：Python格式 + LLM凝练
-    imaging_review = _generate_imaging_review(imaging_data, person_name, surgery_context)
+    # 影像复阅
+    imaging_review = _generate_imaging_review(imaging_data, person_name, entrustment, summary_context)
 
     # 临床检查
     if has_clinical:
@@ -1571,22 +1566,26 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
     else:
         clinical_text = ""
         if imaging_data:
+            # 找到最近日期的检查（通常是法医鉴定前专门做的）
+            latest = max(imaging_data, key=lambda x: x.get("报告日期", ""))
             prompt = f"""你是法医临床学鉴定人。请根据以下信息撰写鉴定过程里的临床检查部分。
 
-被鉴定人：{person_name}
-检查日期：{display_date}
-伤后时间：{time_since}
-以下影像学报告中有阳性发现的关键条目（用于推断查体所见）：
-{chr(10).join(f"- {r.get('检查部位','')}{r.get('检查类型','')}: {(r.get('报告内容','') or '')[:120]}" for r in imaging_data[:15])}
+被鉴定人：{person_name}，检查日期：{display_date}，伤后时间：{time_since}
 
-要求：写"{person_name}自行步入诊室。神志清晰，查体合作。"写"自诉："后跟1-2句核心症状。写"查体："后跟5-6句，只描述阳性体征：手术瘢痕位置及长度、局部压痛、畸形、活动受限等，不写关节活动度度数，不写特殊试验名称。以"四肢肌力及肌张力正常，余查体未见明显异常。"收尾。连续行文不另起标题。只输出临床检查文本。"""
+法医鉴定前最近日期的复查结果（据此推断当前查体所见）：
+{latest.get('医院名称','')} {latest.get('检查部位','')}{latest.get('检查类型','')}: {(latest.get('报告内容') or '')[:300]}
+
+此前已知的损伤和治疗概况：
+{summary_context[:400]}
+
+要求：写"{person_name}自行步入诊室。神志清晰，查体合作。"写"自诉："后1-2句核心症状。写"查体："后5-6句简述手术瘢痕、畸形、压痛、活动受限等阳性体征，不写关节度数，不写特殊试验名称。以"四肢肌力及肌张力正常，余查体未见明显异常。"收尾。连续行文，只输出临床检查文本。"""
             result = call_llm_text_harness(
                 task_name="clinical_exam",
                 system_prompt="你是法医临床学鉴定人。只输出临床检查文本。",
                 instructions=prompt,
-                temperature=0.3,
+                temperature=0.0,
                 max_tokens=1500,
-                max_input_chars=8000,
+                max_input_chars=6000,
                 max_retries=1,
             )
             if result.get("success"):

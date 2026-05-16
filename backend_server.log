@@ -1,0 +1,21 @@
+2026-05-16 12:33:30 [INFO] main: ==================================================
+2026-05-16 12:33:30 [INFO] main: 司法鉴定意见书自动生成系统启动 - 2026-05-16 12:33:30.743514
+2026-05-16 12:33:30 [INFO] main: 日志文件: /Users/anjing137/WorkBuddy/Claw/forensic_report_system/backend/logs/app.log
+2026-05-16 12:33:30 [INFO] main: ==================================================
+INFO:     Started server process [65616]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-05-16 12:33:52 [INFO] app.utils.llm: LLM 调用成功 | provider=minimax | model=MiniMax-M2.7 | tokens: prompt=2599, completion=1253
+2026-05-16 12:33:52 [INFO] app.routers.llm_extract: 案件 9 鉴定过程生成成功（影像 25→10 条）
+2026-05-16 12:33:52 [INFO] app.routers.llm_extract: 报告字段 appraisal_process 已被用户确认，跳过 LLM 生成覆盖
+INFO:     127.0.0.1:52732 - "POST /api/llm/cases/9/generate-appraisal-process HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52836 - "PUT /api/cases/9 HTTP/1.1" 200 OK
+2026-05-16 12:36:22 [INFO] app.utils.llm: LLM 调用成功 | provider=minimax | model=MiniMax-M2.7 | tokens: prompt=2599, completion=1122
+2026-05-16 12:36:22 [INFO] app.routers.llm_extract: 案件 9 鉴定过程生成成功（影像 25→10 条）
+2026-05-16 12:36:22 [INFO] app.routers.llm_extract: 报告字段 appraisal_process 已被用户确认，跳过 LLM 生成覆盖
+INFO:     127.0.0.1:52839 - "POST /api/llm/cases/9/generate-appraisal-process HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [65616]
