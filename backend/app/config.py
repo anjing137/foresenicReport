@@ -20,23 +20,34 @@ class Settings(BaseSettings):
     # 上传文件存储
     UPLOAD_DIR: Path = BASE_DIR / "uploads"
     
-    # 硅基流动 API 配置（OCR + LLM 共用）
+    # 硅基流动 API 配置（仅 OCR 使用）
     SILICONFLOW_API_KEY: str = ""
     SILICONFLOW_BASE_URL: str = "https://api.siliconflow.cn/v1"
     OCR_MODEL: str = "PaddlePaddle/PaddleOCR-VL-1.5"
     OCR_BACKEND: str = "siliconflow"  # siliconflow | local
+    LOCAL_OCR_LANG: str = "ch"
+    LOCAL_OCR_DET_LIMIT_SIDE_LEN: int = 960
 
-    # LLM 配置（硅基流动 Chat Completions）
+    # LLM 配置（OpenAI 兼容 Chat Completions；可接 MiniMax、硅基流动等）
+    LLM_PROVIDER: str = "siliconflow"
+    LLM_API_KEY: str = ""
+    LLM_BASE_URL: str = ""
     LLM_MODEL: str = "Qwen/Qwen3-8B"                # 免费模型，8B参数
     LLM_MODEL_BACKUP: str = "Qwen/Qwen2.5-14B-Instruct"  # 备选付费模型
     LLM_TEMPERATURE: float = 0.1                     # 信息提取用低温，减少幻觉
     LLM_MAX_TOKENS: int = 4096                       # 最大输出 token 数
+    LLM_CLASSIFICATION_ENABLED: bool = True           # 自动分类低置信度页是否启用 LLM 兜底
+    LLM_CLASSIFICATION_MIN_CONFIDENCE: float = 0.80   # 低于该置信度才调用 LLM
+    LLM_CLASSIFIER_MODEL: str = ""                    # 留空则使用 LLM_MODEL
     
     # 报告模板目录
     TEMPLATE_DIR: Path = BASE_DIR / "templates"
     
     # 生成的报告目录
     REPORT_DIR: Path = BASE_DIR / "reports"
+
+    # 法医临床学标准规范库目录
+    STANDARD_LIBRARY_DIR: Path = Path.home() / "Downloads" / "法医临床学标准规范汇编"
     
     # API 配置
     API_HOST: str = "0.0.0.0"

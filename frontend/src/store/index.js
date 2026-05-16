@@ -38,7 +38,7 @@ export const MATERIAL_TYPES = {
   appraisal_application: '鉴定申请书',
   litigation_material: '诉讼材料',
   medical_record: '医院病历',
-  imaging_report: '影像学报告',
+  imaging_report: '检查报告',
 }
 
 export const OCR_STATUS_LABELS = {

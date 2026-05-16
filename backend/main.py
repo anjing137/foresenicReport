@@ -59,7 +59,7 @@ logger.info("=" * 50)
 # ==================== FastAPI 应用 ====================
 
 from app.database import init_db
-from app.routers import cases, materials, medical_records, imaging_reports, reports, style_logs, persons, llm_extract, settings
+from app.routers import cases, materials, medical_records, medical_events, imaging_reports, reports, style_logs, persons, llm_extract, settings, standards
 
 app = FastAPI(
     title="司法鉴定意见书自动生成系统",
@@ -80,12 +80,14 @@ app.add_middleware(
 app.include_router(cases.router)
 app.include_router(materials.router)
 app.include_router(medical_records.router)
+app.include_router(medical_events.router)
 app.include_router(imaging_reports.router)
 app.include_router(reports.router)
 app.include_router(style_logs.router)
 app.include_router(persons.router)
 app.include_router(llm_extract.router)
 app.include_router(settings.router)
+app.include_router(standards.router)
 
 
 @app.on_event("startup")
@@ -94,7 +96,8 @@ def startup():
     # 自动修复：将孤立的 PROCESSING/RECOGNIZING 状态重置（后端重启后后台任务不再存在）
     try:
         from app.database import SessionLocal
-        from app.models.case import Case, CaseStatus, Material, OcrStatus
+        from app.models.case import Case, CaseStatus, Material, MaterialType, OcrStatus
+        from app.utils.material_classifier import classify_material_subtype
         db = SessionLocal()
         orphaned = db.query(Material).filter(Material.ocr_status == OcrStatus.PROCESSING).all()
         if orphaned:
@@ -109,6 +112,22 @@ def startup():
                 c.status = CaseStatus.PENDING_UPLOAD
             db.commit()
             logger.info(f"启动修复：{len(recognizing_cases)} 个 RECOGNIZING 案件已重置为 PENDING_UPLOAD")
+        unclassified = db.query(Material).filter(
+            Material.material_type.in_([MaterialType.MEDICAL_RECORD, MaterialType.IMAGING_REPORT]),
+            Material.ocr_status == OcrStatus.COMPLETED,
+            Material.ocr_text.isnot(None),
+            Material.ocr_text != "",
+            Material.material_subtype.is_(None),
+        ).all()
+        classified_count = 0
+        for material in unclassified:
+            subtype = classify_material_subtype(material.material_type, material.ocr_text)
+            if subtype:
+                material.material_subtype = subtype
+                classified_count += 1
+        if classified_count:
+            db.commit()
+            logger.info(f"启动修复：{classified_count} 个材料已补充子类型标签")
         db.close()
     except Exception as e:
         logger.warning(f"启动修复识别状态时出错: {e}")

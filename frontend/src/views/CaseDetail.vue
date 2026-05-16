@@ -28,11 +28,11 @@
           <span><el-icon><Upload /></el-icon> 上传材料</span>
         </template>
         <div class="upload-panel">
-          <!-- ===== PDF 转换区 ===== -->
+          <!-- ===== 材料导入区 ===== -->
           <div class="pdf-section">
             <div class="pdf-section-header">
               <span class="pdf-section-title">
-                <el-icon><Document /></el-icon> PDF 转换
+                <el-icon><Document /></el-icon> 材料导入
               </span>
               <div class="pdf-view-toggle">
                 <el-button-group size="small">
@@ -48,11 +48,11 @@
 
             <!-- 上传区 -->
             <div class="pdf-upload-area">
-              <input ref="pdfUploadInput" type="file" accept=".pdf" style="display: none;" @change="handlePdfFileSelected" />
+              <input ref="pdfUploadInput" type="file" accept=".pdf,.doc,.docx,image/png,image/jpeg,image/jpg,image/bmp,image/webp,image/tiff" multiple style="display: none;" @change="handlePdfFileSelected" />
               <el-button type="primary" size="default" @click="triggerPdfUpload">
-                <el-icon><Upload /></el-icon> 上传 PDF 文件
+                <el-icon><Upload /></el-icon> 导入材料
               </el-button>
-              <span class="pdf-hint">支持 .pdf 文件，点击或拖拽上传</span>
+              <span class="pdf-hint">支持 PDF、图片、docx；老 .doc 请另存为 .docx 后导入</span>
 
               <!-- 待转换的 PDF 列表 -->
               <div v-if="uploadedPdfs.filter(p => !p.converted).length" class="uploaded-pdfs">
@@ -83,11 +83,11 @@
 
               <!-- 已转换的 PDF 列表 -->
               <div v-if="uploadedPdfs.filter(p => p.converted).length" class="converted-pdfs">
-                <el-divider content-position="left">已转换 PDF</el-divider>
+                <el-divider content-position="left">已进入预分类区</el-divider>
                 <div v-for="pdf in uploadedPdfs.filter(p => p.converted)" :key="pdf.tempId" class="pdf-item">
                   <el-icon><Document /></el-icon>
                   <span class="pdf-name">{{ pdf.filename }}</span>
-                  <el-tag type="success" size="small">已转换 {{ pdf.pageCount }} 页</el-tag>
+                  <el-tag type="success" size="small">已导入 {{ pdf.pageCount }} 页</el-tag>
                   <el-button
                     link
                     type="danger"
@@ -103,7 +103,7 @@
             <!-- 转换进度 -->
             <div v-if="pdfConverting" class="pdf-converting">
               <el-icon class="is-loading" size="20"><Loading /></el-icon>
-              <span>正在转换 PDF，请稍候...</span>
+              <span>正在导入材料，请稍候...</span>
             </div>
 
             <!-- PDF 折叠面板视图 -->
@@ -142,11 +142,23 @@
                     导入选中
                   </el-button>
                 </div>
+                <el-button
+                  v-if="uploadedPdfs.some(p => p.converted)"
+                  size="small"
+                  plain
+                  :loading="analyzingPdfPages"
+                  @click="analyzeAllPdfPages"
+                >
+                  <el-icon><MagicStick /></el-icon> 智能分类导入
+                </el-button>
+                <span v-if="analyzingPdfPages" class="analyze-progress">
+                  已处理 {{ analyzeProgress.done }} / {{ analyzeProgress.total }} 页
+                </span>
               </div>
 
-              <!-- 每个 PDF 的折叠卡片 -->
+              <!-- 每批导入材料的折叠卡片 -->
               <div v-for="pdf in uploadedPdfs" :key="pdf.tempId" class="pdf-fold-card">
-                <!-- PDF 头部：可点击展开/折叠 -->
+                <!-- 材料批次头部：可点击展开/折叠 -->
                 <div class="pdf-fold-header" @click="pdf.expanded = !pdf.expanded">
                   <div class="pdf-fold-left">
                     <el-icon class="fold-arrow" :class="{ 'is-expanded': pdf.expanded }">
@@ -208,6 +220,9 @@
                     <span class="selected-count" v-if="getPdfSelectedCount(pdf.tempId)">
                       已选 {{ getPdfSelectedCount(pdf.tempId) }} 张
                     </span>
+                    <span class="selected-count" v-if="getPdfAnalyzedCount(pdf)">
+                      已识别 {{ getPdfAnalyzedCount(pdf) }} / {{ pdf.pages.length }} 页
+                    </span>
                     <div class="import-controls-inline" v-if="getPdfSelectedCount(pdf.tempId)">
                       <el-select v-model="importTargetType" placeholder="选择类型" size="small" style="width: 130px;">
                         <el-option v-for="cat in materialCategories" :key="cat.type" :label="cat.label" :value="cat.type" />
@@ -238,6 +253,9 @@
                         导入选中
                       </el-button>
                     </div>
+                    <el-button size="small" plain :loading="analyzingPdfPages" @click="analyzePdf(pdf)">
+                      <el-icon><MagicStick /></el-icon> 分类导入本批
+                    </el-button>
                   </div>
 
                   <!-- 缩略图视图 -->
@@ -263,6 +281,14 @@
                       </div>
                       <div class="thumb-info">
                         <span class="thumb-filename" :title="page.filename">{{ page.filename }}</span>
+                        <div v-if="page.analysis?.prediction?.material_type_label" class="thumb-prediction">
+                          <el-tag size="small" :type="predictionTagType(page.analysis.prediction.confidence)" effect="plain">
+                            {{ page.analysis.prediction.material_type_label }}
+                          </el-tag>
+                          <el-tag v-if="page.analysis.prediction.material_subtype_label" size="small" type="info" effect="plain">
+                            {{ page.analysis.prediction.material_subtype_label }}
+                          </el-tag>
+                        </div>
                       </div>
                       <div class="thumb-actions">
                         <el-button link type="primary" size="small" @click="viewPdfPage(page)" title="查看大图">
@@ -312,6 +338,22 @@
                         </template>
                       </el-table-column>
                       <el-table-column prop="filename" label="文件名" show-overflow-tooltip />
+                      <el-table-column label="预分类" width="260">
+                        <template #default="{ row }">
+                          <template v-if="row.analysis?.prediction?.material_type_label">
+                            <el-tag size="small" :type="predictionTagType(row.analysis.prediction.confidence)" effect="plain">
+                              {{ row.analysis.prediction.material_type_label }}
+                            </el-tag>
+                            <el-tag v-if="row.analysis.prediction.material_subtype_label" size="small" type="info" effect="plain" style="margin-left: 4px;">
+                              {{ row.analysis.prediction.material_subtype_label }}
+                            </el-tag>
+                            <span v-if="row.analysis.prediction.group_name" class="prediction-group">
+                              {{ row.analysis.prediction.group_name }}
+                            </span>
+                          </template>
+                          <span v-else style="color: #c0c4cc;">未预分类</span>
+                        </template>
+                      </el-table-column>
                       <el-table-column label="状态" width="100" align="center">
                         <template #default="{ row }">
                           <el-tag v-if="row.imported" type="success" size="small">已导入</el-tag>
@@ -412,8 +454,12 @@
                 <div class="file-info">
                   <el-icon :size="16"><Document /></el-icon>
                   <span class="file-name" :title="mat.original_filename">{{ mat.description || mat.original_filename }}</span>
+                  <el-tag v-if="mat.material_subtype_label" size="small" type="info" effect="plain" class="subtype-tag">
+                    {{ mat.material_subtype_label }}
+                  </el-tag>
                 </div>
                 <div class="file-actions">
+                  <el-button link type="primary" size="small" @click="openMoveMaterialDialog(mat)" :disabled="isCompleted">转移</el-button>
                   <el-button link type="danger" size="small" @click="handleDeleteMaterial(mat)" :disabled="isCompleted">删除</el-button>
                 </div>
               </div>
@@ -424,7 +470,20 @@
               <div v-for="item in getGroupedMaterials(cat.type)" :key="item.group?.id || 'orphan'" class="group-block">
                 <div class="group-header" v-if="item.group">
                   <span class="group-name">🏥 {{ item.group.group_name }}</span>
+                  <el-tag size="small" :type="item.group.is_confirmed ? 'success' : 'warning'" effect="plain">
+                    {{ item.group.is_confirmed ? '已确认' : '待确认' }}
+                  </el-tag>
                   <span class="group-count">{{ item.files.length }}张</span>
+                  <el-button
+                    v-if="!item.group.is_confirmed"
+                    link
+                    type="success"
+                    size="small"
+                    @click="handleConfirmGroupName(item.group)"
+                    :disabled="isCompleted"
+                  >
+                    确认医院名
+                  </el-button>
                   <el-button link type="primary" size="small" @click="handleRenameGroup(item.group)" :disabled="isCompleted">
                     <el-icon><Edit /></el-icon> 改名
                   </el-button>
@@ -439,8 +498,12 @@
                     <div class="file-info">
                       <el-icon :size="16"><Document /></el-icon>
                       <span class="file-name">{{ mat.description || mat.original_filename }}</span>
+                      <el-tag v-if="mat.material_subtype_label" size="small" type="info" effect="plain" class="subtype-tag">
+                        {{ mat.material_subtype_label }}
+                      </el-tag>
                     </div>
                     <div class="file-actions">
+                      <el-button link type="primary" size="small" @click="openMoveMaterialDialog(mat)" :disabled="isCompleted">转移</el-button>
                       <el-button link type="danger" size="small" @click="handleDeleteMaterial(mat)" :disabled="isCompleted">删除</el-button>
                     </div>
                   </div>
@@ -460,7 +523,7 @@
           <!-- 提示 -->
           <div class="upload-hint" v-if="totalMaterialCount > 0">
             <el-alert type="info" :closable="false" show-icon>
-              已上传 {{ totalMaterialCount }} 张材料，请切换到「OCR识别」页进行识别
+              已上传 {{ totalMaterialCount }} 份材料，请切换到「OCR识别」页进行识别
             </el-alert>
           </div>
         </div>
@@ -495,6 +558,9 @@
             <el-button @click="loadCase">
               <el-icon><Refresh /></el-icon> 刷新状态
             </el-button>
+            <el-button @click="handleClassifySubtypes" :loading="classifyingSubtypes" :disabled="completedCount === 0 || ocrRunning">
+              <el-icon><List /></el-icon> 识别子类型
+            </el-button>
           </div>
 
           <el-alert
@@ -514,10 +580,13 @@
 
           <!-- 材料列表 -->
           <el-table :data="allMaterials" empty-text="暂无材料，请先到「上传材料」页上传" size="small" stripe>
-            <el-table-column label="类型" width="140">
+            <el-table-column label="类型" width="230">
               <template #default="{ row }">
                 <el-tag size="small" :color="getTypeColor(row.material_type)" style="color: #fff; border: none;">
                   {{ getTypeLabel(row.material_type) }}
+                </el-tag>
+                <el-tag v-if="row.material_subtype_label" size="small" type="info" effect="plain" style="margin-left: 6px;">
+                  {{ row.material_subtype_label }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -552,6 +621,7 @@
                   查看原文
                 </el-button>
                 <el-button
+                  v-if="canPreviewOriginal(row)"
                   link type="warning"
                   @click="viewOriginalImage(row)"
                 >
@@ -564,7 +634,7 @@
 
           <!-- 统计 -->
           <div class="ocr-stats" v-if="allMaterials.length > 0">
-            <span>共 {{ allMaterials.length }} 张</span>
+            <span>共 {{ allMaterials.length }} 份</span>
             <el-divider direction="vertical" />
             <span style="color: #67C23A;">已完成 {{ completedCount }}</span>
             <el-divider direction="vertical" />
@@ -703,11 +773,14 @@
               </template>
               <div style="margin-bottom: 12px;" v-if="!isCompleted">
                 <el-button type="primary" size="small" @click="loadMedicalGroups" :loading="loadingMedicalGroups">
-                  <el-icon><MagicStick /></el-icon> 智能提取（病历材料）
+                  <el-icon><MagicStick /></el-icon> 建立病历事实卡
                 </el-button>
                 <el-button type="success" size="small" @click="handleGenerateSummary" :loading="generatingSummary" :disabled="!hospitalRecords.length">
                   <el-icon><Document /></el-icon> 生成资料摘要
                 </el-button>
+                <span style="color: #909399; font-size: 12px; margin-left: 8px;">
+                  先按医院分组提取病历事实，确认后再生成资料摘要
+                </span>
               </div>
 
               <!-- 医院分组提取卡片 -->
@@ -744,14 +817,30 @@
                 </el-button>
                 <el-button size="small" @click="medicalGroupList = []" style="margin-left: 8px;">收起</el-button>
               </div>
-              <div v-for="(record, idx) in hospitalRecords" :key="record.id" class="hospital-record-card">
-                <el-card>
+              <div v-for="(record, idx) in hospitalRecords" :key="record.id" class="hospital-record-card fact-card">
+                <el-card shadow="never">
                   <template #header>
                     <div class="record-header">
-                      <span>住院记录 {{ idx + 1 }}：{{ record.hospital_name || '未命名医院' }}（住院号：{{ record.admission_number || '-' }}）</span>
-                      <div v-if="!isCompleted">
-                        <el-button link type="primary" @click="editHospitalRecord(record)">编辑</el-button>
-                        <el-button link type="danger" @click="deleteHospitalRecord(record)">删除</el-button>
+                      <div>
+                        <div class="fact-title">
+                          病历事实 {{ idx + 1 }}：{{ record.hospital_name || '未命名医院' }}
+                          <el-tag size="small" :type="factStatusType(record)" effect="plain">{{ factStatusLabel(record) }}</el-tag>
+                        </div>
+                        <div class="fact-meta">
+                          住院号：{{ record.admission_number || '-' }}
+                          <span>来源页：{{ record.source_material_count || sourceMaterialsForFact(record).length || 0 }} 页</span>
+                          <span v-if="record.extraction_confidence">置信度：{{ record.extraction_confidence }}</span>
+                        </div>
+                      </div>
+                      <div class="record-actions">
+                        <el-button v-if="hasSourceImage(record)" link type="warning" @click="viewFactSourcePages(record, 'hospital')">
+                          {{ sourceImageButtonText(record) }}
+                        </el-button>
+                        <template v-if="!isCompleted">
+                          <el-button link type="success" @click="confirmHospitalRecord(record)" :disabled="factStatus(record) === 'confirmed'">确认事实</el-button>
+                          <el-button link type="primary" @click="editHospitalRecord(record)">编辑</el-button>
+                          <el-button link type="danger" @click="deleteHospitalRecord(record)">删除</el-button>
+                        </template>
                       </div>
                     </div>
                   </template>
@@ -768,10 +857,65 @@
                     <el-descriptions-item label="入院日期">{{ record.admission_date || '-' }}</el-descriptions-item>
                     <el-descriptions-item label="出院日期">{{ record.discharge_date || '-' }}（{{ record.hospital_days || '-' }}天）</el-descriptions-item>
                   </el-descriptions>
+                  <div v-if="eventsForRecord(record).length" class="medical-event-panel">
+                    <div class="medical-event-title">
+                      <span>事件型事实</span>
+                      <el-tag size="small" effect="plain">{{ eventsForRecord(record).length }} 条</el-tag>
+                    </div>
+                    <el-timeline class="medical-event-timeline">
+                      <el-timeline-item
+                        v-for="event in eventsForRecord(record)"
+                        :key="event.id"
+                        :timestamp="event.event_date || '日期未明'"
+                        placement="top"
+                      >
+                        <div class="medical-event-item">
+                          <div class="medical-event-item-head">
+                            <div>
+                              <el-tag size="small" type="info" effect="plain">{{ medicalEventTypeLabel(event.event_type) }}</el-tag>
+                              <el-tag size="small" :type="eventRelevanceType(event)" effect="plain" class="event-source-tag">
+                                {{ eventRelevanceLabel(event) }}
+                              </el-tag>
+                              <el-tag v-if="eventSourceNeedsReview(event)" size="small" type="danger" effect="plain" class="event-source-tag">
+                                来源待核验
+                              </el-tag>
+                              <el-tag v-else-if="eventSourceVerified(event)" size="small" type="success" effect="plain" class="event-source-tag">
+                                来源已校验
+                              </el-tag>
+                              <span class="medical-event-item-title">{{ event.title || medicalEventTypeLabel(event.event_type) }}</span>
+                            </div>
+                            <div class="medical-event-actions">
+                              <el-button v-if="hasSourceImage(event)" link type="warning" @click="viewFactSourcePages(event, 'event')">
+                                {{ sourceImageButtonText(event) }}
+                              </el-button>
+                              <el-button v-if="!isCompleted && factStatus(event) !== 'confirmed'" link type="success" @click="confirmMedicalEvent(event)">
+                                确认
+                              </el-button>
+                              <el-button v-if="!isCompleted" link type="danger" @click="deleteMedicalEvent(event)">
+                                删除
+                              </el-button>
+                            </div>
+                          </div>
+                          <div class="medical-event-summary">{{ event.summary || '-' }}</div>
+                          <div v-if="event.source_quote" class="medical-event-source-quote">
+                            依据：{{ event.source_quote }}
+                          </div>
+                          <div v-if="eventSourceNeedsReview(event)" class="medical-event-warning">
+                            {{ eventQualityLabel(event) }}
+                          </div>
+                          <div v-if="event.diagnosis || event.findings || event.treatment" class="medical-event-extra">
+                            <span v-if="event.diagnosis">诊断：{{ event.diagnosis }}</span>
+                            <span v-if="event.findings">发现：{{ event.findings }}</span>
+                            <span v-if="event.treatment">处理：{{ event.treatment }}</span>
+                          </div>
+                        </div>
+                      </el-timeline-item>
+                    </el-timeline>
+                  </div>
                 </el-card>
               </div>
 
-              <el-empty v-if="!hospitalRecords.length" description="暂无住院记录，请先上传病历材料并执行智能提取" />
+              <el-empty v-if="!hospitalRecords.length" description="暂无病历事实卡，请先上传病历材料并建立病历事实卡" />
 
               <div style="margin-top: 16px;" v-if="!isCompleted">
                 <el-button type="primary" plain @click="showAddRecordDialog = true">
@@ -793,19 +937,31 @@
                 <span>鉴定过程</span>
               </template>
 
+              <div class="process-action-bar" v-if="!isCompleted">
+                <div class="process-action-main">
+                  <el-button type="primary" @click="handleExtractImagingReports" :loading="extractingImaging">
+                    <el-icon><MagicStick /></el-icon> 建立检查事实卡
+                  </el-button>
+                  <el-button type="primary" plain @click="showAddImagingDialog = true">
+                    <el-icon><Plus /></el-icon> 添加检查报告
+                  </el-button>
+                  <el-button type="success" @click="generateAppraisalProcess" :loading="generatingProcess">
+                    <el-icon><MagicStick /></el-icon> 生成鉴定过程
+                  </el-button>
+                </div>
+                <span class="process-action-hint">先整理检查事实，再填写法医临床检查，最后生成鉴定过程正文</span>
+              </div>
+
               <!-- 法医临床检查 -->
               <el-card shadow="never" style="margin-bottom: 16px;">
                 <template #header>
                   <div style="display: flex; align-items: center; justify-content: space-between;">
                     <span style="font-weight: 600;">法医临床学检查</span>
-                    <el-button type="primary" @click="generateAppraisalProcess" :loading="generatingProcess">
-                      <el-icon><MagicStick /></el-icon> 生成鉴定过程
-                    </el-button>
                   </div>
                 </template>
                 <el-form label-width="100px" :disabled="isCompleted" size="small">
                   <el-form-item label="检查日期">
-                    <el-input v-model="caseData.examination_date" placeholder="如：2021年10月22日" style="width: 220px;" />
+                    <el-date-picker v-model="caseData.examination_date" type="date" placeholder="选择日期" value-format="YYYY-MM-DD" style="width: 220px;" />
                   </el-form-item>
                   <el-form-item label="检查内容">
                     <el-input v-model="caseData.clinical_examination" type="textarea" :rows="5"
@@ -817,7 +973,48 @@
                 </el-form>
               </el-card>
 
+              <el-divider>检查事实卡</el-divider>
+              <el-alert
+                type="info"
+                :closable="false"
+                show-icon
+                style="margin-bottom: 12px;"
+                title="检查报告按文字提取；真正的CT/X线/MRI片只作为阅片来源页保存，不强行当作OCR报告。"
+              />
+              <div v-if="imagingReports.length" class="imaging-fact-grid">
+                <el-card v-for="row in imagingReports" :key="row.id" shadow="never" class="fact-card imaging-fact-card">
+                  <template #header>
+                    <div class="record-header">
+                      <div>
+                        <div class="fact-title">
+                          {{ row.hospital_name || '未命名医院' }} / {{ row.exam_type || '检查' }} / {{ row.exam_part || '部位未填' }}
+                          <el-tag size="small" :type="factStatusType(row)" effect="plain">{{ factStatusLabel(row) }}</el-tag>
+                        </div>
+                        <div class="fact-meta">
+                          报告日期：{{ row.report_date || '-' }}
+                          <span>片号：{{ row.film_number || '-' }}</span>
+                          <span>数量：{{ row.film_count || 1 }}</span>
+                        </div>
+                      </div>
+                      <div class="record-actions">
+                        <el-button v-if="hasSourceImage(row)" link type="warning" @click="viewFactSourcePages(row, 'imaging')">
+                          {{ sourceImageButtonText(row) }}
+                        </el-button>
+                        <template v-if="!isCompleted">
+                          <el-button link type="success" @click="confirmImagingReport(row)" :disabled="factStatus(row) === 'confirmed'">确认事实</el-button>
+                          <el-button link type="primary" @click="editImagingReport(row)">编辑</el-button>
+                          <el-button link type="danger" @click="deleteImagingReport(row)">删除</el-button>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+                  <div class="fact-content">{{ row.report_content || '暂无报告内容' }}</div>
+                </el-card>
+              </div>
+              <el-empty v-else description="暂无检查事实卡，请先提取检查报告" />
+
               <!-- 鉴定过程文本 -->
+              <el-divider>鉴定过程正文</el-divider>
               <el-form label-width="100px" :disabled="isCompleted">
                 <el-form-item label="鉴定过程">
                   <el-input v-model="reportData.appraisal_process" type="textarea" :rows="14"
@@ -827,31 +1024,6 @@
                   <el-button type="primary" @click="saveReport">保存鉴定过程</el-button>
                 </el-form-item>
               </el-form>
-
-              <el-divider>影像学报告</el-divider>
-              <el-table :data="imagingReports" empty-text="暂无影像学报告" size="small">
-                <el-table-column prop="report_date" label="报告日期" width="120" />
-                <el-table-column prop="hospital_name" label="医院" />
-                <el-table-column prop="exam_type" label="检查类型" width="80" />
-                <el-table-column prop="exam_part" label="检查部位" width="100" />
-                <el-table-column prop="film_number" label="片子编号" width="120" />
-                <el-table-column prop="film_count" label="数量" width="60" />
-                <el-table-column prop="report_content" label="报告内容" show-overflow-tooltip />
-                <el-table-column label="操作" width="120" v-if="!isCompleted">
-                  <template #default="{ row }">
-                    <el-button link type="primary" @click="editImagingReport(row)">编辑</el-button>
-                    <el-button link type="danger" @click="deleteImagingReport(row)">删除</el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-              <div style="margin-top: 10px; display: flex; gap: 10px;" v-if="!isCompleted">
-                <el-button type="primary" @click="handleExtractImagingReports" :loading="extractingImaging">
-                  <el-icon><MagicStick /></el-icon> 智能提取
-                </el-button>
-                <el-button type="primary" plain @click="showAddImagingDialog = true">
-                  <el-icon><Plus /></el-icon> 添加影像学报告
-                </el-button>
-              </div>
             </el-tab-pane>
 
             <!-- 子Tab 5: 分析说明 -->
@@ -863,7 +1035,45 @@
                 <el-button type="primary" size="small" @click="handleGenerateAnalysis" :loading="extractingAnalysis">
                   <el-icon><MagicStick /></el-icon> 智能生成
                 </el-button>
-                <span style="color: #999; font-size: 12px; margin-left: 8px;">基于住院记录和影像学报告自动生成分析说明</span>
+                <el-button size="small" plain @click="handleImportStandards" :loading="importingStandards">
+                  <el-icon><Files /></el-icon> 导入规范库
+                </el-button>
+                <el-button size="small" plain @click="handleStartStandardOcr" :loading="standardOcrRunning">
+                  <el-icon><MagicStick /></el-icon> OCR扫描版规范
+                </el-button>
+                <el-button size="small" plain @click="openStandardReviewDialog" :loading="loadingStandardReview">
+                  <el-icon><Edit /></el-icon> 规范核验
+                  <span v-if="standardReviewCount !== null">({{ standardReviewCount }})</span>
+                </el-button>
+                <el-button size="small" plain @click="loadCaseStandardReferences" :loading="loadingStandardRefs">
+                  <el-icon><Search /></el-icon> 刷新依据
+                </el-button>
+                <span style="color: #999; font-size: 12px; margin-left: 8px;">基于住院记录和检查报告自动生成分析说明</span>
+              </div>
+              <el-alert
+                v-if="standardOcrStatus?.task?.status === 'running' || standardOcrStatus?.task?.status === 'queued'"
+                type="info"
+                :closable="false"
+                show-icon
+                style="margin-bottom: 12px;"
+              >
+                <template #title>
+                  规范 OCR 后台运行中：{{ standardOcrStatus.task.completed_documents || 0 }} / {{ standardOcrStatus.task.total || 0 }} 个文档
+                  <span v-if="standardOcrStatus.task.current_title">；当前：{{ standardOcrStatus.task.current_title }}</span>
+                </template>
+              </el-alert>
+              <div v-if="standardReferences.length" class="standard-reference-box">
+                <div class="standard-reference-title">本案匹配到的规范依据</div>
+                <el-collapse>
+                  <el-collapse-item
+                    v-for="(ref, idx) in standardReferences"
+                    :key="ref.id || idx"
+                    :title="standardReferenceTitle(ref, idx)"
+                    :name="idx"
+                  >
+                    <div class="standard-reference-text">{{ ref.snippet || ref.text }}</div>
+                  </el-collapse-item>
+                </el-collapse>
               </div>
               <el-form label-width="100px" :disabled="isCompleted">
                 <el-form-item label="分析说明">
@@ -919,6 +1129,40 @@
           <span style="color: #E6A23C; font-weight: 600;"><el-icon><Document /></el-icon> 报告预览</span>
         </template>
 
+        <el-card shadow="never" class="precheck-card">
+          <template #header>
+            <div class="record-header">
+              <span style="font-weight: 600;">生成前检查</span>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <el-tag :type="hardPrecheckWarnings.length ? 'warning' : 'success'" effect="plain">
+                  {{ hardPrecheckWarnings.length ? `${hardPrecheckWarnings.length} 项需注意` : '可以生成' }}
+                </el-tag>
+                <el-button
+                  v-if="!isCompleted"
+                  type="success"
+                  size="small"
+                  @click="generateFullReport"
+                  :loading="generatingFullReport"
+                >
+                  <el-icon><MagicStick /></el-icon> 一键生成完整报告
+                </el-button>
+              </div>
+            </div>
+          </template>
+          <div class="precheck-grid">
+            <div v-for="item in reportGenerationChecks" :key="item.label" class="precheck-item">
+              <el-icon :color="item.ok ? '#67c23a' : (item.soft ? '#e6a23c' : '#f56c6c')">
+                <CircleCheck v-if="item.ok" />
+                <Warning v-else />
+              </el-icon>
+              <div>
+                <div class="precheck-title">{{ item.label }}</div>
+                <div class="precheck-detail">{{ item.detail }}</div>
+              </div>
+            </div>
+          </div>
+        </el-card>
+
         <!-- 预览文档 -->
         <div class="report-preview">
           <div class="report-paper">
@@ -955,7 +1199,7 @@
                   </tr>
                   <tr>
                     <td class="label-cell">鉴定地点：</td>
-                    <td>{{ caseData.appraisal_location || '新乡医学院司法鉴定中心' }}</td>
+                    <td>{{ caseData.appraisal_location || '河南医药大学司法鉴定中心' }}</td>
                   </tr>
                   <template v-if="caseData.on_site_personnel">
                     <tr>
@@ -1042,7 +1286,7 @@
                 <span class="underline-blank"></span>
               </div>
               <div class="footer-line" style="margin-top: 20px;">
-                <span>{{ caseData.appraisal_location || '新乡医学院司法鉴定中心' }}</span>
+                <span>{{ caseData.appraisal_location || '河南医药大学司法鉴定中心' }}</span>
               </div>
               <div class="footer-line">
                 <span>{{ caseData.acceptance_date || '____年____月____日' }}</span>
@@ -1110,15 +1354,57 @@
     </el-dialog>
 
     <!-- 修改组名对话框 -->
-    <el-dialog v-model="showRenameGroupDialog" title="修改名称" width="400px">
+    <el-dialog v-model="showRenameGroupDialog" :title="renameGroupConfirmMode ? '确认医院标准名称' : '修改名称'" width="440px">
       <el-form @submit.prevent="confirmRenameGroup">
         <el-form-item :label="currentGroupLabel + '名称'">
           <el-input v-model="renameGroupName" placeholder="如：新乡市中心医院" />
         </el-form-item>
+        <el-alert
+          v-if="renameGroupConfirmMode"
+          type="info"
+          :closable="false"
+          show-icon
+          title="确认后，系统会把相近的 OCR 错名合并到这个名称，后续自动分类也会优先使用它。"
+        />
       </el-form>
       <template #footer>
         <el-button @click="showRenameGroupDialog = false">取消</el-button>
-        <el-button type="primary" @click="confirmRenameGroup" :loading="uploading">确定</el-button>
+        <el-button type="primary" @click="confirmRenameGroup" :loading="uploading">
+          {{ renameGroupConfirmMode ? '确认并合并' : '确定' }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 材料分类纠错对话框 -->
+    <el-dialog v-model="showMoveMaterialDialog" title="转移材料" width="460px">
+      <el-form label-width="100px">
+        <el-form-item label="材料">
+          <span class="move-material-name">{{ movingMaterial?.description || movingMaterial?.original_filename }}</span>
+        </el-form-item>
+        <el-form-item label="目标类别">
+          <el-select v-model="moveTargetType" style="width: 100%;">
+            <el-option v-for="cat in materialCategories" :key="cat.type" :label="cat.label" :value="cat.type" />
+          </el-select>
+        </el-form-item>
+        <template v-if="getCategoryGrouped(moveTargetType)">
+          <el-form-item label="目标医院">
+            <el-select v-model="moveTargetGroupId" placeholder="选择已有医院" style="width: 100%;" clearable>
+              <el-option
+                v-for="g in getGroupsForType(moveTargetType)"
+                :key="g.id"
+                :label="g.group_name"
+                :value="g.id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="新医院名">
+            <el-input v-model="moveTargetGroupName" placeholder="如需新建或更正医院名，在这里输入" clearable />
+          </el-form-item>
+        </template>
+      </el-form>
+      <template #footer>
+        <el-button @click="showMoveMaterialDialog = false">取消</el-button>
+        <el-button type="primary" @click="confirmMoveMaterial" :loading="movingMaterialSaving">确定转移</el-button>
       </template>
     </el-dialog>
 
@@ -1172,7 +1458,7 @@
           </div>
         </div>
         <!-- 原图引用提示 -->
-        <div v-if="ocrViewMode !== 'edit' && viewingMaterial?.file_path" class="ocr-image-ref">
+        <div v-if="ocrViewMode !== 'edit' && canPreviewOriginal(viewingMaterial)" class="ocr-image-ref">
           <el-divider content-position="left">引用原图</el-divider>
           <div class="ref-line">
             <code>![]({{ materialImageUrl }})</code>
@@ -1186,7 +1472,7 @@
 
     <!-- 原图查看对话框 -->
     <el-dialog v-model="showImageDialog" :title="`原始图片 - ${viewingMaterial?.description || viewingMaterial?.original_filename || ''}`" width="80%" top="3vh">
-      <div v-if="viewingMaterial?.file_path" class="original-image-view" ref="imageContainerRef"
+      <div v-if="canPreviewOriginal(viewingMaterial)" class="original-image-view" ref="imageContainerRef"
         @mousedown="onImageDragStart"
         @mousemove="onImageDragMove"
         @mouseup="onImageDragEnd"
@@ -1206,6 +1492,51 @@
           <el-icon><ZoomIn /></el-icon>
         </el-button>
         <el-button size="small" @click="zoomReset">重置</el-button>
+      </div>
+    </el-dialog>
+
+    <!-- 事实卡来源页查看对话框 -->
+    <el-dialog v-model="showSourcePagesDialog" :title="sourcePagesTitle" width="92%" top="3vh" class="source-pages-dialog">
+      <div v-loading="loadingSourcePages" class="source-pages-layout">
+        <div class="source-page-list">
+          <div
+            v-for="page in sourcePages"
+            :key="page.id"
+            class="source-page-thumb"
+            :class="{ active: selectedSourcePage?.id === page.id }"
+            @click="selectSourcePage(page)"
+          >
+            <img v-if="page.file_path" :src="getMaterialImageUrl(page)" :alt="page.original_filename || page.filename" />
+            <div class="source-page-thumb-title">{{ page.description || page.original_filename || page.filename || `第${page.page_number || ''}页` }}</div>
+            <div class="source-page-thumb-meta">
+              第{{ sourcePageDisplayNumber(page) }}页
+              <el-tag size="small" :type="ocrStatusTag(page.ocr_status)" effect="plain">{{ ocrStatusLabel(page.ocr_status) }}</el-tag>
+            </div>
+          </div>
+        </div>
+        <div class="source-page-main">
+          <template v-if="selectedSourcePage">
+            <div class="source-page-toolbar">
+              <span>{{ selectedSourcePage.description || selectedSourcePage.original_filename || selectedSourcePage.filename }}</span>
+              <div>
+                <el-button size="small" @click="sourcePageZoom = Math.max(0.5, Math.round((sourcePageZoom - 0.1) * 100) / 100)">-</el-button>
+                <span class="zoom-label">{{ Math.round(sourcePageZoom * 100) }}%</span>
+                <el-button size="small" @click="sourcePageZoom = Math.min(3, Math.round((sourcePageZoom + 0.1) * 100) / 100)">+</el-button>
+                <el-button size="small" @click="viewOcrText(selectedSourcePage)" :disabled="selectedSourcePage.ocr_status !== 'completed'">查看OCR</el-button>
+              </div>
+            </div>
+            <div class="source-page-image-scroll">
+              <img
+                v-if="selectedSourcePage.file_path"
+                :src="getMaterialImageUrl(selectedSourcePage)"
+                :alt="selectedSourcePage.original_filename || selectedSourcePage.filename"
+                :style="{ transform: `scale(${sourcePageZoom})`, transformOrigin: 'left top' }"
+              />
+              <el-empty v-else description="无来源图片" />
+            </div>
+          </template>
+          <el-empty v-else description="没有可查看的来源页" />
+        </div>
       </div>
     </el-dialog>
 
@@ -1270,13 +1601,16 @@
         </el-row>
       </el-form>
       <template #footer>
+        <el-button v-if="hasSourceImage(editingRecord)" type="warning" plain @click="viewFactSourcePages(editingRecord, 'hospital')">
+          查看来源页
+        </el-button>
         <el-button @click="showRecordDialog = false">取消</el-button>
         <el-button type="primary" @click="saveHospitalRecord" :loading="saving">保存</el-button>
       </template>
     </el-dialog>
 
-    <!-- 影像学报告编辑对话框 -->
-    <el-dialog v-model="showImagingDialog" :title="editingImaging.id ? '编辑影像学报告' : '添加影像学报告'" width="600px">
+    <!-- 检查报告编辑对话框 -->
+    <el-dialog v-model="showImagingDialog" :title="editingImaging.id ? '编辑检查报告' : '添加检查报告'" width="600px">
       <el-form :model="editingImaging" label-width="100px">
         <el-row :gutter="16">
           <el-col :span="12">
@@ -1324,6 +1658,9 @@
         </el-form-item>
       </el-form>
       <template #footer>
+        <el-button v-if="hasSourceImage(editingImaging)" type="warning" plain @click="viewFactSourcePages(editingImaging, 'imaging')">
+          查看来源页
+        </el-button>
         <el-button @click="showImagingDialog = false">取消</el-button>
         <el-button type="primary" @click="saveImagingReport" :loading="saving">保存</el-button>
       </template>
@@ -1341,6 +1678,21 @@
           :style="{ transform: `scale(${pdfImageZoom})`, transformOrigin: 'left top' }" />
       </div>
       <el-empty v-else description="无图片" />
+
+      <div v-if="viewingPdfPage?.analysis?.prediction?.material_type_label" class="pdf-prediction-panel">
+        <el-tag size="small" :type="predictionTagType(viewingPdfPage.analysis.prediction.confidence)" effect="plain">
+          {{ viewingPdfPage.analysis.prediction.material_type_label }}
+        </el-tag>
+        <el-tag v-if="viewingPdfPage.analysis.prediction.material_subtype_label" size="small" type="info" effect="plain">
+          {{ viewingPdfPage.analysis.prediction.material_subtype_label }}
+        </el-tag>
+        <span v-if="viewingPdfPage.analysis.prediction.group_name">
+          {{ viewingPdfPage.analysis.prediction.group_name }}
+        </span>
+        <span class="prediction-reason">
+          {{ viewingPdfPage.analysis.prediction.reason }}
+        </span>
+      </div>
 
       <!-- 查看器控制栏 -->
       <div class="pdf-viewer-controls">
@@ -1394,6 +1746,106 @@
         </div>
       </div>
     </el-dialog>
+
+    <!-- 规范 OCR 人工核验 -->
+    <el-dialog v-model="showStandardReviewDialog" title="规范 OCR 核验" width="94%" top="3vh" class="standard-review-dialog">
+      <div class="standard-review-toolbar">
+        <el-radio-group v-model="standardReviewStatus" size="small" @change="loadStandardReviewPages">
+          <el-radio-button label="needs_review">需复核 {{ standardReviewStatusCounts.needs_review || 0 }}</el-radio-button>
+          <el-radio-button label="completed">已通过 {{ standardReviewStatusCounts.completed || 0 }}</el-radio-button>
+          <el-radio-button label="all">全部</el-radio-button>
+        </el-radio-group>
+        <el-button size="small" plain @click="loadStandardReviewPages" :loading="loadingStandardReview">
+          <el-icon><Refresh /></el-icon> 刷新
+        </el-button>
+      </div>
+
+      <div class="standard-review-layout">
+        <div class="standard-review-list">
+          <el-table
+            :data="standardReviewPages"
+            size="small"
+            height="640"
+            stripe
+            highlight-current-row
+            empty-text="暂无需要核验的页面"
+            @row-click="selectStandardReviewPage"
+          >
+            <el-table-column label="规范" min-width="210" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.document_title }}</template>
+            </el-table-column>
+            <el-table-column prop="page_number" label="页" width="54" />
+            <el-table-column label="状态" width="86">
+              <template #default="{ row }">
+                <el-tag size="small" :type="standardReviewTagType(row.proofread_status)">
+                  {{ standardReviewStatusLabel(row.proofread_status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="proofread_confidence" label="置信" width="62" />
+          </el-table>
+        </div>
+
+        <div class="standard-review-main" v-if="selectedStandardReviewPage">
+          <div class="standard-review-head">
+            <div>
+              <div class="standard-review-title">{{ selectedStandardReviewPage.document_title }}</div>
+              <div class="standard-review-meta">
+                第 {{ selectedStandardReviewPage.page_number }} 页
+                <span v-if="selectedStandardReviewPage.proofread_notes">；{{ selectedStandardReviewPage.proofread_notes }}</span>
+              </div>
+            </div>
+            <div class="standard-review-actions">
+              <el-button size="small" @click="resetStandardReviewText">恢复 OCR 文本</el-button>
+              <el-button size="small" plain @click="saveStandardReviewPage('needs_review')" :loading="savingStandardReview">仍需复核</el-button>
+              <el-button size="small" type="primary" @click="saveStandardReviewPage('completed')" :loading="savingStandardReview">保存并通过</el-button>
+            </div>
+          </div>
+
+          <div v-if="selectedStandardReviewPage.quality_flags?.length" class="standard-review-flags">
+            <el-tag v-for="flag in selectedStandardReviewPage.quality_flags" :key="flag" size="small" type="warning" effect="plain">
+              {{ flag }}
+            </el-tag>
+          </div>
+
+          <div class="standard-review-compare">
+            <div class="standard-review-image-pane">
+              <div class="standard-review-pane-head">
+                <span>原页图片</span>
+                <div class="standard-review-zoom">
+                  <el-button size="small" @click="standardReviewImageZoom = Math.max(0.5, standardReviewImageZoom - 0.1)">-</el-button>
+                  <span>{{ Math.round(standardReviewImageZoom * 100) }}%</span>
+                  <el-button size="small" @click="standardReviewImageZoom = Math.min(2.5, standardReviewImageZoom + 0.1)">+</el-button>
+                </div>
+              </div>
+              <div class="standard-review-image-scroll" v-if="selectedStandardReviewPage.image_url">
+                <img
+                  :src="getBackendUrl(selectedStandardReviewPage.image_url)"
+                  :alt="`${selectedStandardReviewPage.document_title} 第${selectedStandardReviewPage.page_number}页`"
+                  :style="{ transform: `scale(${standardReviewImageZoom})`, transformOrigin: 'left top' }"
+                />
+              </div>
+              <el-empty v-else description="无页面图片" />
+            </div>
+
+            <div class="standard-review-text-pane">
+              <div class="standard-review-pane-head">
+                <span>校对文本</span>
+                <span>{{ standardReviewText.length }} 字</span>
+              </div>
+              <el-input
+                v-model="standardReviewText"
+                type="textarea"
+                :rows="28"
+                resize="none"
+                placeholder="对照左侧原图修正 OCR 文本，然后点击保存并通过"
+              />
+            </div>
+          </div>
+        </div>
+        <el-empty v-else class="standard-review-empty" description="请选择一页进行核验" />
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -1405,7 +1857,7 @@ import {
   Upload, Plus, VideoCamera, Check, CircleCheck, RefreshLeft,
   Document, Refresh, PictureFilled, Files, Postcard, Notebook, FirstAidKit,
   Edit, MagicStick, Loading, Download, ZoomIn, ZoomOut, OfficeBuilding,
-  Grid, List, Delete, ArrowDown, ArrowRight
+  Grid, List, Delete, ArrowDown, ArrowRight, Search, Warning
 } from '@element-plus/icons-vue'
 import api from '@/api'
 
@@ -1419,6 +1871,7 @@ const activeSubTab = ref('basic')
 const caseData = ref({ person: null, materials: [], hospital_records: [], imaging_reports: [], report: null })
 const personData = ref({ name: '', gender: '', birth_date: '', id_number: '', address: '' })
 const hospitalRecords = ref([])
+const medicalEvents = ref([])
 const imagingReports = ref([])
 const reportData = ref({ case_facts: '', material_summary: '', appraisal_process: '', analysis: '', opinion: '', opinion_confirmed: false })
 
@@ -1435,6 +1888,7 @@ const ocrRunning = ref(false)
 const ocrTask = ref(null)
 const ocrPollTimer = ref(null)
 const recognizingIds = ref(new Set())  // 正在识别的材料ID集合
+const classifyingSubtypes = ref(false)
 
 // LLM 提取状态
 const extracting = ref(false)  // 全局提取（旧）
@@ -1444,9 +1898,26 @@ const extractingMedical = ref(false)
 const generatingSummary = ref(false)
 const extractingImaging = ref(false)
 const generatingProcess = ref(false)
+const generatingFullReport = ref(false)
 const extractingAnalysis = ref(false)
 const extractingOpinion = ref(false)
 const generatingWord = ref(false)
+const importingStandards = ref(false)
+const loadingStandardRefs = ref(false)
+const standardReferences = ref([])
+const standardOcrRunning = ref(false)
+const standardOcrStatus = ref(null)
+const standardOcrPollTimer = ref(null)
+const showStandardReviewDialog = ref(false)
+const loadingStandardReview = ref(false)
+const savingStandardReview = ref(false)
+const standardReviewStatus = ref('needs_review')
+const standardReviewPages = ref([])
+const selectedStandardReviewPage = ref(null)
+const standardReviewText = ref('')
+const standardReviewStatusCounts = ref({})
+const standardReviewCount = ref(null)
+const standardReviewImageZoom = ref(1)
 
 // 新增分组对话框
 const showNewGroupDialog = ref(false)
@@ -1455,6 +1926,14 @@ const currentGroupLabel = ref('医院')
 const showRenameGroupDialog = ref(false)
 const renameGroupId = ref(null)
 const renameGroupName = ref('')
+const renameGroupConfirmMode = ref(false)
+const renamingGroup = ref(null)
+const showMoveMaterialDialog = ref(false)
+const movingMaterial = ref(null)
+const moveTargetType = ref('')
+const moveTargetGroupId = ref(null)
+const moveTargetGroupName = ref('')
+const movingMaterialSaving = ref(false)
 
 // OCR 查看
 const showOcrDialog = ref(false)
@@ -1475,6 +1954,9 @@ const pdfNewGroupName = ref('')
 const importedPdfPages = ref([])
 const showImportedList = ref(true)
 const uploadedPdfs = ref([])  // [{tempId, filename, size, file, converting, converted, pageCount, expanded, pages}]
+const analyzingPdfPages = ref(false)
+const analyzeProgress = ref({ done: 0, total: 0, analyzed: 0, reused: 0, failed: 0 })
+const PDF_ANALYZE_BATCH_SIZE = 10
 
 // PDF 查看相关
 const showPdfImageDialog = ref(false)
@@ -1489,6 +1971,14 @@ const viewingPdfNewGroupName = ref('')
 const importingPdfPage = ref(false)
 const revertingPdfPage = ref(false)
 
+// 事实卡来源页查看
+const showSourcePagesDialog = ref(false)
+const sourcePagesTitle = ref('来源页')
+const sourcePages = ref([])
+const selectedSourcePage = ref(null)
+const sourcePageZoom = ref(1)
+const loadingSourcePages = ref(false)
+
 watch(importTargetType, () => {
   importTargetGroupId.value = null
   pdfNewGroupName.value = ''
@@ -1497,6 +1987,11 @@ watch(importTargetType, () => {
 watch(viewingPdfImportType, () => {
   viewingPdfImportGroupId.value = null
   viewingPdfNewGroupName.value = ''
+})
+
+watch(moveTargetType, () => {
+  moveTargetGroupId.value = null
+  moveTargetGroupName.value = ''
 })
 
 // 轻量 Markdown → HTML 渲染（覆盖OCR文本常见格式）
@@ -1579,7 +2074,7 @@ async function reRecognizeMaterial() {
   reRecognizing.value = true
   try {
     const caseId = mat.case_id
-    await api.recognizeSingle(caseId, mat.id)
+    const result = await api.recognizeSingle(caseId, mat.id)
     // 刷新案件材料列表获取完整 ocr_text
     await loadCase()
     // 重新定位到该材料
@@ -1587,6 +2082,9 @@ async function reRecognizeMaterial() {
     if (updated) {
       viewingMaterial.value = updated
       ocrEditText.value = updated.ocr_text || ''
+    }
+    if (result.status !== 'completed') {
+      throw new Error(result.error || result.message || 'OCR 未返回识别结果')
     }
     ocrViewMode.value = 'render'
     ElMessage.success('重新识别完成')
@@ -1726,25 +2224,131 @@ function onPdfImageDragEnd() {
 function triggerPdfUpload() {
   pdfUploadInput.value?.click()
 }
-function handlePdfFileSelected(event) {
-  const file = event.target.files?.[0]
-  if (!file) return
-  const rawFile = file
-  if (!rawFile.name?.toLowerCase().endsWith('.pdf')) {
-    ElMessage.error('只支持 PDF 文件')
-    return
-  }
-  // 只是添加到待转换列表，不自动转换
+function addPendingPdf(rawFile) {
   const tempId = Date.now() + Math.random()
   uploadedPdfs.value.push({
     tempId,
     filename: rawFile.name,
     size: rawFile.size || 0,
     file: rawFile,
+    sourceType: 'pdf',
     converting: false,
     converted: false,
     pageCount: 0
   })
+}
+
+function addConvertedImportBatch(result, fallbackName = '图片导入') {
+  if (!result?.pages?.length) return
+  const firstPage = result.pages[0]
+  const prefixMatch = firstPage.filename.match(/^(case\d+_\w+)-\d+\.png$/)
+  uploadedPdfs.value.push({
+    tempId: Date.now() + Math.random(),
+    filename: result.batch_name || fallbackName,
+    size: 0,
+    file: null,
+    sourceType: result.source_type || 'image_batch',
+    converting: false,
+    converted: true,
+    pageCount: result.total_pages || result.pages.length,
+    pages: result.pages.map(p => ({ ...p, imported: false, material_id: null })),
+    prefix: prefixMatch ? prefixMatch[1] : null,
+    expanded: true
+  })
+}
+
+function isDocFile(file) {
+  const name = file?.name?.toLowerCase() || ''
+  return name.endsWith('.doc') && !name.endsWith('.docx')
+}
+
+function isDocxFile(file) {
+  return (file?.name?.toLowerCase() || '').endsWith('.docx')
+}
+
+function isPdfFile(file) {
+  return (file?.name?.toLowerCase() || '').endsWith('.pdf')
+}
+
+function isImageFile(file) {
+  const name = file?.name?.toLowerCase() || ''
+  return file?.type?.startsWith('image/') || /\.(png|jpe?g|bmp|webp|tiff?)$/.test(name)
+}
+
+async function handlePdfFileSelected(event) {
+  const files = Array.from(event.target.files || [])
+  if (!files.length) return
+
+  const pdfFiles = []
+  const imageFiles = []
+  const docxFiles = []
+  const rejected = []
+
+  files.forEach(file => {
+    if (isDocFile(file)) {
+      ElMessage.warning(`暂不支持 .doc 老格式：${file.name}，请先另存为 .docx 后导入`)
+    } else if (isPdfFile(file)) {
+      pdfFiles.push(file)
+    } else if (isDocxFile(file)) {
+      docxFiles.push(file)
+    } else if (isImageFile(file)) {
+      imageFiles.push(file)
+    } else {
+      rejected.push(file.name)
+    }
+  })
+
+  if (rejected.length) {
+    ElMessage.warning(`已跳过不支持的文件：${rejected.join('、')}`)
+  }
+
+  pdfFiles.forEach(addPendingPdf)
+
+  if (imageFiles.length || docxFiles.length) {
+    pdfConverting.value = true
+    try {
+      if (imageFiles.length) {
+        const imageResult = await api.uploadImagePages(caseId, imageFiles)
+        addConvertedImportBatch(imageResult, imageFiles.length === 1 ? imageFiles[0].name : `图片导入（${imageFiles.length}张）`)
+        ElMessage.success(`图片已导入预分类区，共 ${imageResult.total_pages || imageFiles.length} 张`)
+      }
+
+      let docxImported = 0
+      let docxPending = 0
+      for (const file of docxFiles) {
+        try {
+          const result = await api.uploadDocxMaterial(caseId, file)
+          if (result.imported) {
+            docxImported += 1
+          } else {
+            docxPending += 1
+            ElMessage.warning(`${file.name} 未自动导入：${result.error || '未能判断材料类型'}`)
+          }
+        } catch (e) {
+          docxPending += 1
+          ElMessage.warning(`${file.name} 未自动导入：${e.response?.data?.detail || e.message || '解析失败'}`)
+        }
+      }
+      if (docxImported) {
+        ElMessage.success(`Word 文档已自动导入 ${docxImported} 份`)
+        await loadCase()
+      }
+      if (docxPending) {
+        await loadCase()
+      }
+    } catch (e) {
+      ElMessage.error('材料导入失败: ' + (e.response?.data?.detail || e.message || '未知错误'))
+    } finally {
+      pdfConverting.value = false
+      event.target.value = ''
+    }
+  } else {
+    event.target.value = ''
+  }
+
+  if (pdfFiles.length) {
+    ElMessage.success(`已加入 ${pdfFiles.length} 个 PDF，点击“转成图片”后进入预分类`)
+  }
 }
 async function convertPdf(pdfItem) {
   // 找到对应的 PDF 项并标记为转换中
@@ -1759,6 +2363,7 @@ async function convertPdf(pdfItem) {
       target.converted = true
       target.pageCount = result.total_pages
       target.filename = result.pdf_filename  // 使用返回的原始文件名
+      target.sourceType = 'pdf'
       target.expanded = true  // 转换后默认展开
       // 保存文件名前缀，用于删除时定位文件
       const firstPage = result.pages[0]
@@ -1813,6 +2418,7 @@ async function loadPdfPages() {
             prefix: prefix,
             size: 0,
             file: null,
+            sourceType: p.source_type || 'pdf',
             converting: false,
             converted: true,
             pageCount: 0,
@@ -1830,6 +2436,94 @@ async function loadPdfPages() {
     console.error('加载 PDF 页面失败', e)
   }
 }
+
+function getPdfAnalyzedCount(pdf) {
+  return (pdf.pages || []).filter(p => p.analysis?.ocr_status === 'completed').length
+}
+
+function predictionTagType(confidence) {
+  if (confidence >= 0.85) return 'success'
+  if (confidence >= 0.65) return 'warning'
+  return 'info'
+}
+
+async function analyzePdfFilenames(filenames) {
+  const uniqueFilenames = Array.from(new Set(filenames))
+  const aggregate = {
+    done: 0,
+    total: uniqueFilenames.length,
+    analyzed: 0,
+    reused: 0,
+    failed: 0,
+    imported: 0,
+    importFailed: 0,
+    skipped: 0
+  }
+  analyzeProgress.value = { ...aggregate }
+
+  for (let i = 0; i < uniqueFilenames.length; i += PDF_ANALYZE_BATCH_SIZE) {
+    const batch = uniqueFilenames.slice(i, i + PDF_ANALYZE_BATCH_SIZE)
+    const result = await api.autoImportPdfPages(caseId, { filenames: batch })
+    aggregate.analyzed += result.analyzed || 0
+    aggregate.reused += result.reused || 0
+    aggregate.failed += result.ocr_failed || 0
+    aggregate.imported += result.imported?.length || 0
+    aggregate.importFailed += result.failed?.length || 0
+    aggregate.skipped += result.skipped?.length || 0
+    aggregate.done = Math.min(i + batch.length, uniqueFilenames.length)
+    analyzeProgress.value = { ...aggregate }
+    await loadPdfPages()
+  }
+  await loadCase()
+  selectedPdfPages.value = selectedPdfPages.value.filter(s => !uniqueFilenames.includes(s.filename))
+
+  return aggregate
+}
+
+async function analyzePdf(pdf) {
+  if (!pdf?.pages?.length) return
+  const filenames = pdf.pages.filter(p => !p.imported).map(p => p.filename)
+  if (!filenames.length) {
+    ElMessage.info('该批材料页面均已导入')
+    return
+  }
+  try {
+    analyzingPdfPages.value = true
+    const result = await analyzePdfFilenames(filenames)
+    const pending = (result.importFailed || 0) + (result.failed || 0)
+    ElMessage.success(`自动分类完成：导入 ${result.imported || 0} 张，复用 ${result.reused || 0} 张${pending ? `，待人工处理 ${pending} 张` : ''}`)
+  } catch (e) {
+    ElMessage.error('材料自动分类导入失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    analyzingPdfPages.value = false
+    analyzeProgress.value = { done: 0, total: 0, analyzed: 0, reused: 0, failed: 0 }
+  }
+}
+
+async function analyzeAllPdfPages() {
+  const filenames = []
+  uploadedPdfs.value.forEach(pdf => {
+    ;(pdf.pages || []).forEach(page => {
+      if (!page.imported) filenames.push(page.filename)
+    })
+  })
+  if (!filenames.length) {
+    ElMessage.info('没有可自动分类的未导入页面')
+    return
+  }
+  try {
+    analyzingPdfPages.value = true
+    const result = await analyzePdfFilenames(filenames)
+    const pending = (result.importFailed || 0) + (result.failed || 0)
+    ElMessage.success(`自动分类完成：导入 ${result.imported || 0} 张，复用 ${result.reused || 0} 张${pending ? `，待人工处理 ${pending} 张` : ''}`)
+  } catch (e) {
+    ElMessage.error('材料自动分类导入失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    analyzingPdfPages.value = false
+    analyzeProgress.value = { done: 0, total: 0, analyzed: 0, reused: 0, failed: 0 }
+  }
+}
+
 async function refreshImportedPdfPages() {
   const pages = await api.getPdfPages(caseId)
   importedPdfPages.value = pages
@@ -1963,8 +2657,8 @@ async function revertPdfImport(page) {
       found.page.material_type_label = null
     }
     await refreshImportedPdfPages()
-    // 刷新材料列表
-    await loadMaterialsGrouped()
+    // 同步刷新案件详情、PDF 状态和已上传材料列表
+    await loadCase()
     ElMessage.success('已撤销导入')
   } catch (e) {
     ElMessage.error('撤销失败: ' + (e.response?.data?.detail || e.message))
@@ -1982,7 +2676,7 @@ function onQuickImportTypeChange(row, type) {
   // 分组类型需要选择医院组，暂时不支持快速导入分组类型
   const cat = materialCategories.find(c => c.type === type)
   if (cat?.grouped) {
-    ElMessage.warning('分组类型（病历/影像学报告）暂不支持单页快速导入，请使用批量导入')
+    ElMessage.warning('分组类型（病历/检查报告）暂不支持单页快速导入，请使用批量导入')
     row.quickImportType = null
     return
   }
@@ -2007,8 +2701,7 @@ async function quickImportSingle(row) {
     if (result.failed && result.failed.length > 0) {
       ElMessage.warning(`${result.failed.length} 张导入失败`)
     }
-    await loadPdfPages()
-    await loadMaterialsGrouped()
+    await loadCase()
   } catch (e) {
     ElMessage.error('导入失败: ' + (e.response?.data?.detail || e.message))
   }
@@ -2039,9 +2732,8 @@ async function importViewingPage() {
     if (result.imported && result.imported.length > 0) {
       ElMessage.success('已导入')
     }
-    // 刷新
-    await loadPdfPages()
-    await loadMaterialsGrouped()
+    // 同步刷新，避免已上传材料区域滞后
+    await loadCase()
     // 更新对话框中的页面信息
     const found = findPdfAndPage(viewingPdfPage.value.filename)
     if (found) {
@@ -2065,8 +2757,7 @@ async function revertViewingPdfPage() {
     revertingPdfPage.value = true
     await api.revertPdfImport(caseId, viewingPdfPage.value.filename)
     ElMessage.success('已撤销导入')
-    await loadPdfPages()
-    await loadMaterialsGrouped()
+    await loadCase()
     // 更新对话框中的页面信息
     const found = findPdfAndPage(viewingPdfPage.value.filename)
     if (found) {
@@ -2111,10 +2802,8 @@ async function importSelectedPdfPages() {
     if (result.failed && result.failed.length > 0) {
       ElMessage.warning(`${result.failed.length} 张导入失败`)
     }
-    // 刷新 PDF 页面状态
-    await loadPdfPages()
-    // 刷新材料列表（让导入的材料显示到对应分类下）
-    await loadMaterialsGrouped()
+    // 同步刷新 PDF 页面状态和已上传材料列表
+    await loadCase()
     selectedPdfPages.value = []
     pdfNewGroupName.value = ''
     importTargetGroupId.value = null
@@ -2153,8 +2842,7 @@ async function importSelectedPdfPagesOfPdf(pdf) {
     if (result.failed && result.failed.length > 0) {
       ElMessage.warning(`${result.failed.length} 张导入失败`)
     }
-    await loadPdfPages()
-    await loadMaterialsGrouped()
+    await loadCase()
     // 清除该 PDF 的选中
     selectedPdfPages.value = selectedPdfPages.value.filter(s => s.pdfTempId !== pdf.tempId)
   } catch (e) {
@@ -2194,7 +2882,7 @@ const materialCategories = [
   { type: 'appraisal_application', label: '鉴定申请书', icon: 'Notebook', color: '#F56C6C', grouped: false },
   { type: 'litigation_material', label: '诉讼材料', icon: 'Files', color: '#14B8A6', grouped: false },
   { type: 'medical_record', label: '医院病历', icon: 'FirstAidKit', color: '#909399', grouped: true, groupLabel: '医院' },
-  { type: 'imaging_report', label: '影像学报告', icon: 'PictureFilled', color: '#9B59B6', grouped: true, groupLabel: '医院' },
+  { type: 'imaging_report', label: '检查报告', icon: 'PictureFilled', color: '#9B59B6', grouped: true, groupLabel: '医院' },
 ]
 
 // === 计算属性 ===
@@ -2211,6 +2899,51 @@ const allSectionsFilled = computed(() => {
     reportData.value.opinion
   )
 })
+
+const pendingHospitalRecordCount = computed(() =>
+  hospitalRecords.value.filter(item => factStatus(item) !== 'confirmed').length
+)
+
+const pendingImagingReportCount = computed(() =>
+  imagingReports.value.filter(item => factStatus(item) !== 'confirmed').length
+)
+
+const reportGenerationChecks = computed(() => [
+  {
+    label: '基本信息',
+    ok: !!(caseData.value.entrusting_unit && caseData.value.entrustment_matter && personData.value.name),
+    detail: '委托单位、委托事项、被鉴定人信息',
+  },
+  {
+    label: '病历事实',
+    ok: hospitalRecords.value.length > 0 && pendingHospitalRecordCount.value === 0,
+    detail: hospitalRecords.value.length
+      ? `${hospitalRecords.value.length} 条，${pendingHospitalRecordCount.value} 条待确认`
+      : '暂无病历事实',
+  },
+  {
+    label: '检查事实',
+    ok: imagingReports.value.length === 0 || pendingImagingReportCount.value === 0,
+    detail: imagingReports.value.length
+      ? `${imagingReports.value.length} 条，${pendingImagingReportCount.value} 条待确认`
+      : '暂无检查事实',
+  },
+  {
+    label: '报告正文',
+    ok: allSectionsFilled.value,
+    detail: '基本案情、资料摘要、鉴定过程、分析说明、鉴定意见',
+  },
+  {
+    label: '规范依据',
+    ok: standardReferences.value.length > 0,
+    detail: standardReferences.value.length ? `已匹配 ${standardReferences.value.length} 条` : '暂未匹配，可先生成但需人工核对',
+    soft: true,
+  },
+])
+
+const hardPrecheckWarnings = computed(() =>
+  reportGenerationChecks.value.filter(item => !item.ok && !item.soft)
+)
 
 const allMaterials = computed(() => {
   // 把 materialsByType 展平为列表，加 _recognizing 标记
@@ -2303,10 +3036,16 @@ onMounted(async () => {
   if (ocrRunning.value) {
     startOcrPolling()
   }
+  await refreshStandardOcrStatus({ silent: true })
+  if (standardOcrRunning.value) {
+    startStandardOcrPolling()
+  }
+  await refreshStandardReviewCount()
 })
 
 onBeforeUnmount(() => {
   stopOcrPolling()
+  stopStandardOcrPolling()
 })
 
 async function loadCase() {
@@ -2314,6 +3053,7 @@ async function loadCase() {
     const data = await api.getCase(caseId)
     caseData.value = data
     hospitalRecords.value = data.hospital_records || []
+    medicalEvents.value = data.medical_events || []
     imagingReports.value = data.imaging_reports || []
     if (data.person) {
       personData.value = { ...data.person }
@@ -2324,6 +3064,7 @@ async function loadCase() {
     await loadMaterialsGrouped()
     // 加载 PDF 转换页面
     await loadPdfPages()
+    await loadCaseStandardReferences(true)
   } catch (e) {
     ElMessage.error('加载案件失败')
   }
@@ -2486,14 +3227,31 @@ async function handleRecognizeSingle(mat) {
     recognizingIds.value.add(mat.id)
     // 强制触发响应式更新
     recognizingIds.value = new Set(recognizingIds.value)
-    await api.recognizeSingle(caseId, mat.id)
+    const result = await api.recognizeSingle(caseId, mat.id)
+    if (result.status !== 'completed') {
+      throw new Error(result.error || result.message || 'OCR 未返回识别结果')
+    }
     ElMessage.success(`识别完成：${mat.description || mat.original_filename}`)
     await loadCase()
   } catch (e) {
-    ElMessage.error('识别失败')
+    await loadCase()
+    ElMessage.error('识别失败：' + (e.response?.data?.detail || e.message || '未知错误'))
   } finally {
     recognizingIds.value.delete(mat.id)
     recognizingIds.value = new Set(recognizingIds.value)
+  }
+}
+
+async function handleClassifySubtypes() {
+  try {
+    classifyingSubtypes.value = true
+    const result = await api.classifyMaterialSubtypes(caseId)
+    await loadMaterialsGrouped()
+    ElMessage.success(`子类型识别完成：更新 ${result.updated || 0} / ${result.total || 0} 张`)
+  } catch (e) {
+    ElMessage.error('子类型识别失败')
+  } finally {
+    classifyingSubtypes.value = false
   }
 }
 
@@ -2728,21 +3486,236 @@ async function generateAppraisalProcess() {
   }
 }
 
-// 鉴定过程：智能提取影像学报告（只提取数据到表格，不自动生成鉴定过程）
+// 一键生成完整报告：鉴定过程 → 分析说明 → 鉴定意见
+async function generateFullReport() {
+  try {
+    generatingFullReport.value = true
+    // 先保存法医检查信息
+    await api.updateCase(caseId, {
+      examination_date: caseData.value.examination_date,
+      clinical_examination: caseData.value.clinical_examination,
+    })
+    const result = await api.generateFullReport(caseId)
+    if (result.sections) {
+      // 刷新报告数据
+      await loadCase()
+      // 汇总提示
+      const sections = result.sections
+      const statusMsgs = []
+      for (const [key, val] of Object.entries(sections)) {
+        const labels = { appraisal_process: '鉴定过程', analysis: '分析说明', opinion: '鉴定意见' }
+        const label = labels[key] || key
+        if (val.status === 'ok') {
+          statusMsgs.push(`${label} 生成成功（${val.method || 'llm'}，${val.length}字）`)
+        } else if (val.status === 'skipped') {
+          statusMsgs.push(`${label} 跳过（${val.error}）`)
+        } else {
+          statusMsgs.push(`${label} 失败（${val.error}）`)
+        }
+      }
+      ElMessage.success('完整报告生成完成')
+      // 逐节提示
+      setTimeout(() => {
+        statusMsgs.forEach(m => ElMessage.info(m))
+      }, 300)
+    }
+  } catch (e) {
+    ElMessage.error('报告生成失败：' + (e.response?.data?.detail || '未知错误'))
+  } finally {
+    generatingFullReport.value = false
+  }
+}
+
+// 鉴定过程：智能提取检查报告（只提取数据到表格，不自动生成鉴定过程）
 async function handleExtractImagingReports() {
   try {
     extractingImaging.value = true
     const result = await api.extractImagingReports(caseId)
-    ElMessage.success(result.message || '影像学报告提取完成')
+    ElMessage.success(result.message || '检查报告提取完成')
     await loadCase()
   } catch (e) {
-    ElMessage.error('影像学报告提取失败：' + (e.response?.data?.detail || '未知错误'))
+    ElMessage.error('检查报告提取失败：' + (e.response?.data?.detail || '未知错误'))
   } finally {
     extractingImaging.value = false
   }
 }
 
-// 分析说明：基于住院记录和影像学报告生成
+function standardReferenceTitle(ref, idx) {
+  const section = [ref.section_code, ref.section_title].filter(Boolean).join(' ')
+  return `${idx + 1}. 《${ref.standard_name}》${section ? ` ${section}` : ''}`
+}
+
+function standardReviewStatusLabel(status) {
+  const map = {
+    pending: '待校对',
+    processing: '校对中',
+    completed: '已通过',
+    needs_review: '需复核',
+    failed: '失败'
+  }
+  return map[status] || status || '未知'
+}
+
+function standardReviewTagType(status) {
+  const map = {
+    pending: 'info',
+    processing: 'warning',
+    completed: 'success',
+    needs_review: 'warning',
+    failed: 'danger'
+  }
+  return map[status] || 'info'
+}
+
+async function refreshStandardReviewCount() {
+  try {
+    const result = await api.getStandardReviewPages({ status: 'needs_review', include_text: false, limit: 1 })
+    standardReviewStatusCounts.value = result.status_counts || {}
+    standardReviewCount.value = standardReviewStatusCounts.value.needs_review || 0
+  } catch (e) {
+    standardReviewCount.value = null
+  }
+}
+
+async function openStandardReviewDialog() {
+  showStandardReviewDialog.value = true
+  await loadStandardReviewPages()
+}
+
+async function loadStandardReviewPages() {
+  try {
+    loadingStandardReview.value = true
+    const result = await api.getStandardReviewPages({
+      status: standardReviewStatus.value,
+      include_text: true,
+      limit: 500
+    })
+    standardReviewPages.value = result.pages || []
+    standardReviewStatusCounts.value = result.status_counts || {}
+    standardReviewCount.value = standardReviewStatusCounts.value.needs_review || 0
+
+    const currentId = selectedStandardReviewPage.value?.id
+    const nextPage = standardReviewPages.value.find(page => page.id === currentId) || standardReviewPages.value[0] || null
+    selectStandardReviewPage(nextPage)
+  } catch (e) {
+    ElMessage.error('加载规范核验页失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    loadingStandardReview.value = false
+  }
+}
+
+function selectStandardReviewPage(page) {
+  selectedStandardReviewPage.value = page || null
+  standardReviewText.value = page?.current_text || page?.proofread_text || page?.ocr_text || ''
+  standardReviewImageZoom.value = 1
+}
+
+function resetStandardReviewText() {
+  standardReviewText.value = selectedStandardReviewPage.value?.ocr_text || ''
+}
+
+async function saveStandardReviewPage(status = 'completed') {
+  if (!selectedStandardReviewPage.value) return
+  try {
+    savingStandardReview.value = true
+    const result = await api.updateStandardReviewPage(selectedStandardReviewPage.value.id, {
+      proofread_text: standardReviewText.value,
+      proofread_status: status,
+      proofread_confidence: status === 'completed' ? 100 : selectedStandardReviewPage.value.proofread_confidence,
+      proofread_notes: status === 'completed' ? '人工核验通过' : '人工核验后仍需复核'
+    })
+    ElMessage.success(result.message || '已保存规范页核验结果')
+    await loadStandardReviewPages()
+  } catch (e) {
+    ElMessage.error('保存规范核验结果失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    savingStandardReview.value = false
+  }
+}
+
+async function handleImportStandards() {
+  try {
+    importingStandards.value = true
+    const result = await api.importStandards({ force: true })
+    ElMessage.success(`规范库导入完成：成功 ${result.imported || 0} 个，需OCR ${result.needs_ocr || 0} 个`)
+    await loadCaseStandardReferences()
+  } catch (e) {
+    ElMessage.error('规范库导入失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    importingStandards.value = false
+  }
+}
+
+async function loadCaseStandardReferences(silent = false) {
+  try {
+    loadingStandardRefs.value = true
+    const result = await api.getCaseStandardReferences(caseId, 8)
+    standardReferences.value = result.references || []
+    if (!silent && !standardReferences.value.length) {
+      ElMessage.info('暂未匹配到规范依据，可先导入规范库')
+    }
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('规范依据检索失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+    }
+  } finally {
+    loadingStandardRefs.value = false
+  }
+}
+
+function stopStandardOcrPolling() {
+  if (standardOcrPollTimer.value) {
+    clearInterval(standardOcrPollTimer.value)
+    standardOcrPollTimer.value = null
+  }
+}
+
+function startStandardOcrPolling() {
+  stopStandardOcrPolling()
+  standardOcrPollTimer.value = setInterval(() => {
+    refreshStandardOcrStatus({ silent: true })
+  }, 5000)
+}
+
+async function refreshStandardOcrStatus({ silent = false } = {}) {
+  try {
+    const wasRunning = standardOcrRunning.value
+    const status = await api.getStandardsOcrStatus()
+    standardOcrStatus.value = status
+    const task = status.task
+    standardOcrRunning.value = task?.status === 'running' || task?.status === 'queued'
+    if (!standardOcrRunning.value && wasRunning) {
+      stopStandardOcrPolling()
+      await loadCaseStandardReferences(true)
+      if (!silent && task?.status === 'completed') {
+        ElMessage.success('规范 OCR 已完成')
+      } else if (!silent && task?.status === 'failed') {
+        ElMessage.error('规范 OCR 失败：' + (task.error || '未知错误'))
+      }
+    }
+    return status
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('规范 OCR 状态刷新失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+    }
+    return null
+  }
+}
+
+async function handleStartStandardOcr() {
+  try {
+    const result = await api.startStandardsOcr({ pilot_only: true, retry_failed: true })
+    ElMessage.success(result.message || '已启动规范 OCR')
+    await refreshStandardOcrStatus({ silent: true })
+    if (standardOcrRunning.value) {
+      startStandardOcrPolling()
+    }
+  } catch (e) {
+    ElMessage.error('启动规范 OCR 失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  }
+}
+
+// 分析说明：基于住院记录和检查报告生成
 async function handleGenerateAnalysis() {
   try {
     extractingAnalysis.value = true
@@ -2750,6 +3723,7 @@ async function handleGenerateAnalysis() {
     if (result.analysis) {
       reportData.value.analysis = result.analysis
     }
+    standardReferences.value = result.standard_references || standardReferences.value
     // 提示用户生成方式
     if (result.method === 'fallback') {
       ElMessage.warning('LLM服务暂不可用，已使用拼接模式生成，建议稍后重试')
@@ -2773,6 +3747,7 @@ async function handleGenerateOpinion() {
     if (result.opinion) {
       reportData.value.opinion = result.opinion
     }
+    standardReferences.value = result.standard_references || standardReferences.value
     // 不再调用 loadCase()，避免用数据库旧值覆盖刚生成的内容
   } catch (e) {
     ElMessage.error('鉴定意见生成失败：' + (e.response?.data?.detail || '未知错误'))
@@ -2788,6 +3763,14 @@ async function handleGenerateWord() {
     return
   }
   try {
+    if (hardPrecheckWarnings.value.length) {
+      const detail = hardPrecheckWarnings.value.map(item => `${item.label}：${item.detail}`).join('\n')
+      await ElMessageBox.confirm(
+        `还有以下事实或正文未完成确认：\n${detail}\n\n仍要生成 Word 吗？`,
+        '生成前检查',
+        { type: 'warning', confirmButtonText: '继续生成', cancelButtonText: '先去核验' }
+      )
+    }
     generatingWord.value = true
     // 使用 fetch 直接下载文件
     const resp = await fetch(`/api/reports/${reportData.value.id}/generate-word`, {
@@ -2812,6 +3795,7 @@ async function handleGenerateWord() {
     window.URL.revokeObjectURL(url)
     ElMessage.success('报告生成成功')
   } catch (e) {
+    if (e === 'cancel' || e === 'close') return
     ElMessage.error('生成报告失败：' + (e.message || '未知错误'))
   } finally {
     generatingWord.value = false
@@ -2896,8 +3880,20 @@ async function confirmAddGroup() {
 }
 
 function handleRenameGroup(group) {
+  renamingGroup.value = group
   renameGroupId.value = group.id
   renameGroupName.value = group.group_name
+  renameGroupConfirmMode.value = false
+  currentGroupLabel.value = group.material_type === 'imaging_report' ? '医院' : '医院'
+  showRenameGroupDialog.value = true
+}
+
+function handleConfirmGroupName(group) {
+  renamingGroup.value = group
+  renameGroupId.value = group.id
+  renameGroupName.value = group.group_name
+  renameGroupConfirmMode.value = true
+  currentGroupLabel.value = '医院'
   showRenameGroupDialog.value = true
 }
 
@@ -2908,16 +3904,26 @@ async function confirmRenameGroup() {
   }
   uploading.value = true
   try {
-    await api.updateMaterialGroup(renameGroupId.value, {
-      group_name: renameGroupName.value.trim(),
-    })
-    ElMessage.success('名称修改成功')
+    if (renameGroupConfirmMode.value) {
+      await api.confirmHospitalGroupName(renameGroupId.value, {
+        canonical_name: renameGroupName.value.trim(),
+        merge_similar: true,
+      })
+      ElMessage.success('医院名称已确认，已合并相近 OCR 错名')
+    } else {
+      await api.updateMaterialGroup(renameGroupId.value, {
+        group_name: renameGroupName.value.trim(),
+      })
+      ElMessage.success('名称修改成功')
+    }
     showRenameGroupDialog.value = false
     await loadCase()
   } catch (e) {
-    ElMessage.error('修改名称失败')
+    ElMessage.error(renameGroupConfirmMode.value ? '确认医院名称失败' : '修改名称失败')
   } finally {
     uploading.value = false
+    renameGroupConfirmMode.value = false
+    renamingGroup.value = null
   }
 }
 
@@ -2943,6 +3949,46 @@ async function handleDeleteMaterial(mat) {
   } catch (e) { /* 取消 */ }
 }
 
+function openMoveMaterialDialog(mat) {
+  movingMaterial.value = mat
+  moveTargetType.value = mat.material_type
+  moveTargetGroupId.value = null
+  moveTargetGroupName.value = ''
+  showMoveMaterialDialog.value = true
+  nextTick(() => {
+    moveTargetGroupId.value = mat.group_id || null
+  })
+}
+
+async function confirmMoveMaterial() {
+  if (!movingMaterial.value) return
+  if (!moveTargetType.value) {
+    ElMessage.warning('请选择目标类别')
+    return
+  }
+  const targetGrouped = getCategoryGrouped(moveTargetType.value)
+  if (targetGrouped && !moveTargetGroupId.value && !moveTargetGroupName.value.trim()) {
+    ElMessage.warning('请选择目标医院，或输入新医院名')
+    return
+  }
+
+  movingMaterialSaving.value = true
+  try {
+    await api.moveMaterial(movingMaterial.value.id, {
+      material_type: moveTargetType.value,
+      group_id: targetGrouped ? (moveTargetGroupId.value || null) : null,
+      group_name: targetGrouped ? moveTargetGroupName.value.trim() : null,
+    })
+    ElMessage.success('材料已转移')
+    showMoveMaterialDialog.value = false
+    await loadCase()
+  } catch (e) {
+    ElMessage.error('转移失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    movingMaterialSaving.value = false
+  }
+}
+
 // === 查看 OCR 文本 ===
 function viewOcrText(mat) {
   viewingMaterial.value = mat
@@ -2956,6 +4002,11 @@ function getBackendUrl(relativePath) {
   if (!relativePath) return ''
   const baseUrl = `${window.location.protocol}//${window.location.hostname}:8000`
   return relativePath.startsWith('/') ? `${baseUrl}${relativePath}` : `${baseUrl}/${relativePath}`
+}
+
+function canPreviewOriginal(mat) {
+  const fp = mat?.file_path || mat?.source_material_file_path || ''
+  return /\.(png|jpe?g|bmp|webp|tiff?)$/i.test(fp)
 }
 
 // 获取材料图片URL
@@ -2974,6 +4025,10 @@ function getMaterialImageUrl(mat) {
 
 // 查看原图
 function viewOriginalImage(mat) {
+  if (!canPreviewOriginal(mat)) {
+    ElMessage.info('该材料不是图片文件，请点击“查看原文”查看解析文本')
+    return
+  }
   viewingMaterial.value = mat
   imageZoom.value = 1
   showImageDialog.value = true
@@ -2984,6 +4039,299 @@ function viewOriginalImage(mat) {
       imageContainerRef.value.scrollTop = 0
     }
   })
+}
+
+function resolveSourceMaterial(item) {
+  if (!item) return null
+  const sourceId = item.source_material_id || item.material_id
+  if (sourceId) {
+    const material = allMaterials.value.find(m => m.id === sourceId)
+    if (material) return material
+  }
+
+  const filePath = item.source_material_file_path || item.source_material_image_url
+  if (!filePath) return null
+  return {
+    id: sourceId,
+    file_path: filePath,
+    original_filename: item.source_material_filename || '来源原图',
+    description: item.source_material_description || (
+      item.source_material_page_number ? `来源原图（第${item.source_material_page_number}页）` : '来源原图'
+    ),
+  }
+}
+
+function normalizeSourcePage(page) {
+  if (!page) return null
+  const material = page.id ? allMaterials.value.find(m => m.id === page.id) : null
+  return {
+    ...(material || {}),
+    ...page,
+    original_filename: page.original_filename || page.filename || material?.original_filename,
+    original_page_number: page.original_page_number || material?.original_page_number,
+    file_path: page.file_path || material?.file_path || page.image_url,
+    ocr_text: page.ocr_text || material?.ocr_text,
+    ocr_status: page.ocr_status || material?.ocr_status || 'pending',
+  }
+}
+
+function sourcePageDisplayNumber(page) {
+  return page?.original_page_number || page?.page_number || '-'
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed : []
+  } catch (e) {
+    return []
+  }
+}
+
+function sourceMaterialsForFact(item) {
+  if (!item) return []
+  let pages = []
+  const sourceIds = parseJsonArray(item.source_material_ids).map(id => Number(id)).filter(Boolean)
+  if (sourceIds.length) {
+    pages = allMaterials.value.filter(m => sourceIds.includes(Number(m.id)))
+  } else if (item.group_id && !item.event_type) {
+    pages = allMaterials.value.filter(m => m.group_id === item.group_id)
+  } else {
+    const sourceId = item.source_material_id || item.material_id
+    if (sourceId) {
+      pages = allMaterials.value.filter(m => m.id === sourceId)
+    }
+  }
+  if (!pages.length) {
+    const material = resolveSourceMaterial(item)
+    if (material) pages = [material]
+  }
+  return pages
+    .map(normalizeSourcePage)
+    .filter(Boolean)
+    .sort((a, b) => {
+      const ap = a.original_page_number ?? a.page_number ?? 999999
+      const bp = b.original_page_number ?? b.page_number ?? 999999
+      return ap - bp || (a.id || 0) - (b.id || 0)
+    })
+}
+
+function hasSourceImage(item) {
+  return sourceMaterialsForFact(item).length > 0 || !!resolveSourceMaterial(item)?.file_path
+}
+
+function sourceImageButtonText(item) {
+  const count = item?.source_material_count || sourceMaterialsForFact(item).length
+  return count > 1 ? `来源页(${count})` : '来源页'
+}
+
+function viewSourceImage(item) {
+  viewFactSourcePages(item)
+}
+
+function selectSourcePage(page) {
+  selectedSourcePage.value = normalizeSourcePage(page)
+  sourcePageZoom.value = 1
+}
+
+async function viewFactSourcePages(item, kind = '') {
+  let pages = sourceMaterialsForFact(item)
+  sourcePagesTitle.value = kind === 'event'
+    ? `事件事实来源页 - ${item.title || medicalEventTypeLabel(item.event_type) || ''}`.trim()
+    : kind === 'imaging'
+    ? `检查事实来源页 - ${item.hospital_name || ''} ${item.exam_type || ''} ${item.exam_part || ''}`.trim()
+    : `病历事实来源页 - ${item.hospital_name || item.source_material_filename || ''}`.trim()
+  showSourcePagesDialog.value = true
+  loadingSourcePages.value = true
+  try {
+    if (item?.id && kind === 'hospital') {
+      const result = await api.getHospitalRecordSourcePages(item.id)
+      if (result.pages?.length) pages = result.pages.map(normalizeSourcePage)
+    } else if (item?.id && kind === 'imaging') {
+      const result = await api.getImagingReportSourcePages(item.id)
+      if (result.pages?.length) pages = result.pages.map(normalizeSourcePage)
+    } else if (item?.id && kind === 'event') {
+      const result = await api.getMedicalEventSourcePages(item.id)
+      if (result.pages?.length) pages = result.pages.map(normalizeSourcePage)
+    }
+  } catch (e) {
+    // 本地 allMaterials 已经能兜底展示来源页，接口失败不打断医生校对。
+  } finally {
+    loadingSourcePages.value = false
+  }
+  sourcePages.value = pages
+  selectedSourcePage.value = pages[0] || null
+  sourcePageZoom.value = 1
+  if (!pages.length) ElMessage.warning('没有找到来源页')
+}
+
+function medicalEventTypeLabel(type) {
+  const map = {
+    admission: '入院',
+    discharge: '出院',
+    surgery: '手术',
+    progress: '病程',
+    consultation: '会诊',
+    exam: '检查检验',
+    treatment: '治疗',
+    medication: '用药',
+    diagnosis: '诊断',
+    other: '其他',
+  }
+  return map[type] || '病历事件'
+}
+
+const medicalEventTypeOrder = {
+  admission: 10,
+  diagnosis: 20,
+  exam: 30,
+  surgery: 40,
+  treatment: 50,
+  progress: 60,
+  medication: 70,
+  consultation: 80,
+  discharge: 90,
+  other: 100,
+}
+
+function medicalEventSortKey(event) {
+  const rawDate = event?.event_date || '9999-99-99 99:99'
+  return {
+    day: rawDate.slice(0, 10),
+    typeOrder: medicalEventTypeOrder[event?.event_type] || 100,
+    rawDate,
+    id: event?.id || 0,
+  }
+}
+
+function eventsForRecord(record) {
+  if (!record) return []
+  return medicalEvents.value
+    .filter(event => (
+      (record.id && event.hospital_record_id === record.id)
+      || (record.group_id && event.group_id === record.group_id)
+    ))
+    .sort((a, b) => {
+      const ak = medicalEventSortKey(a)
+      const bk = medicalEventSortKey(b)
+      return ak.day.localeCompare(bk.day, 'zh-Hans-CN')
+        || ak.typeOrder - bk.typeOrder
+        || ak.rawDate.localeCompare(bk.rawDate, 'zh-Hans-CN')
+        || ak.id - bk.id
+    })
+}
+
+function factStatus(item) {
+  return item?.review_status || 'pending'
+}
+
+function factStatusLabel(item) {
+  const map = {
+    pending: '待核验',
+    confirmed: '已确认',
+    needs_edit: '需修改',
+  }
+  return map[factStatus(item)] || '待核验'
+}
+
+function factStatusType(item) {
+  const map = {
+    pending: 'warning',
+    confirmed: 'success',
+    needs_edit: 'danger',
+  }
+  return map[factStatus(item)] || 'warning'
+}
+
+function eventQualityFlags(event) {
+  return parseJsonArray(event?.quality_flags).map(flag => String(flag || ''))
+}
+
+function eventSourceNeedsReview(event) {
+  const flags = eventQualityFlags(event)
+  return factStatus(event) === 'needs_edit'
+    || flags.some(flag => flag.startsWith('event_source_unverified') || flag.startsWith('event_source_invalid') || flag.startsWith('source_unresolved'))
+}
+
+function eventSourceVerified(event) {
+  return eventQualityFlags(event).some(flag => flag.startsWith('event_source_verified'))
+}
+
+function eventRelevanceLevel(event) {
+  const flag = eventQualityFlags(event).find(item => item.startsWith('relevance:'))
+  return flag ? flag.split(':')[1] : 'medium'
+}
+
+function eventRelevanceLabel(event) {
+  const map = {
+    high: '高度相关',
+    medium: '中度相关',
+    support: '辅助相关',
+    low: '低相关候选',
+  }
+  return map[eventRelevanceLevel(event)] || '中度相关'
+}
+
+function eventRelevanceType(event) {
+  const map = {
+    high: 'success',
+    medium: 'primary',
+    support: 'info',
+    low: 'warning',
+  }
+  return map[eventRelevanceLevel(event)] || 'primary'
+}
+
+function eventQualityLabel(event) {
+  const flags = eventQualityFlags(event)
+  if (flags.some(flag => flag.includes('no_source_quote'))) return '这条事实缺少可核对的原文依据，请对照来源页确认。'
+  if (flags.some(flag => flag.includes('quote_not_found'))) return '原文依据未能在来源页中直接命中，请重点核对。'
+  if (flags.some(flag => flag.includes('no_keyword_match'))) return '事实关键词未能在来源页中命中，请检查来源页是否正确。'
+  if (flags.some(flag => flag.startsWith('event_source_invalid'))) return '模型返回了不在本分块内的来源页，请重新提取或人工修正。'
+  return '来源证据校验未通过，请对照原图核验。'
+}
+
+async function confirmHospitalRecord(record) {
+  try {
+    await api.updateHospitalRecord(record.id, { review_status: 'confirmed' })
+    record.review_status = 'confirmed'
+    ElMessage.success('病历事实已确认')
+  } catch (e) {
+    ElMessage.error('确认失败')
+  }
+}
+
+async function confirmImagingReport(report) {
+  try {
+    await api.updateImagingReport(report.id, { review_status: 'confirmed' })
+    report.review_status = 'confirmed'
+    ElMessage.success('检查事实已确认')
+  } catch (e) {
+    ElMessage.error('确认失败')
+  }
+}
+
+async function confirmMedicalEvent(event) {
+  try {
+    await api.updateMedicalEvent(event.id, { review_status: 'confirmed' })
+    event.review_status = 'confirmed'
+    ElMessage.success('事件事实已确认')
+  } catch (e) {
+    ElMessage.error('确认失败')
+  }
+}
+
+async function deleteMedicalEvent(event) {
+  try {
+    await ElMessageBox.confirm('确定删除这条事件事实？删除后将不再进入资料摘要。', '提示', { type: 'warning' })
+    await api.deleteMedicalEvent(event.id)
+    medicalEvents.value = medicalEvents.value.filter(item => item.id !== event.id)
+    ElMessage.success('事件事实已删除')
+  } catch (e) {
+    // 用户取消时不提示。
+  }
 }
 
 // === 住院记录 ===
@@ -3028,7 +4376,7 @@ watch(showAddRecordDialog, (val) => {
   }
 })
 
-// === 影像学报告 ===
+// === 检查报告 ===
 function editImagingReport(record) {
   editingImaging.value = { ...record }
   showImagingDialog.value = true
@@ -3036,7 +4384,7 @@ function editImagingReport(record) {
 
 async function deleteImagingReport(record) {
   try {
-    await ElMessageBox.confirm('确定删除此影像学报告？', '提示', { type: 'warning' })
+    await ElMessageBox.confirm('确定删除此检查报告？', '提示', { type: 'warning' })
     await api.deleteImagingReport(record.id)
     ElMessage.success('删除成功')
     await loadCase()
@@ -3090,8 +4438,411 @@ watch(showAddImagingDialog, (val) => {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 12px;
+
+      .record-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+      }
     }
   }
+
+  .fact-card {
+    margin-bottom: 12px;
+
+    .fact-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 14px;
+      color: #303133;
+    }
+
+    .fact-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 5px;
+      color: #909399;
+      font-size: 12px;
+    }
+
+    .fact-content {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      color: #303133;
+      font-size: 13px;
+    }
+  }
+
+  .imaging-fact-grid {
+    display: grid;
+    gap: 12px;
+  }
+
+  .process-action-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px;
+    margin-bottom: 14px;
+    border: 1px solid #ebeef5;
+    border-radius: 6px;
+    background: #fafafa;
+  }
+
+  .process-action-main {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .process-action-hint {
+    color: #909399;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .medical-event-panel {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #ebeef5;
+  }
+
+  .medical-event-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #303133;
+  }
+
+  .medical-event-timeline {
+    padding-left: 6px;
+  }
+
+  .medical-event-item {
+    padding: 8px 10px;
+    border: 1px solid #ebeef5;
+    border-radius: 6px;
+    background: #fafafa;
+  }
+
+  .medical-event-item-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+
+  .medical-event-item-title {
+    margin-left: 8px;
+    font-weight: 600;
+    color: #303133;
+  }
+
+  .event-source-tag {
+    margin-left: 6px;
+  }
+
+  .medical-event-actions {
+    white-space: nowrap;
+  }
+
+  .medical-event-summary {
+    color: #303133;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+  }
+
+  .medical-event-source-quote {
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-left: 3px solid #c0c4cc;
+    background: #fff;
+    color: #606266;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+
+  .medical-event-warning {
+    margin-top: 6px;
+    color: #f56c6c;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .medical-event-extra {
+    display: grid;
+    gap: 4px;
+    margin-top: 6px;
+    color: #606266;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .precheck-card {
+    max-width: 900px;
+    margin: 0 auto 16px;
+  }
+
+  .precheck-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+  }
+
+  .precheck-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid #ebeef5;
+    border-radius: 6px;
+    background: #fafafa;
+  }
+
+  .precheck-title {
+    font-weight: 600;
+    color: #303133;
+    font-size: 13px;
+  }
+
+  .precheck-detail {
+    margin-top: 3px;
+    color: #909399;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .source-pages-layout {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    gap: 14px;
+    min-height: 68vh;
+  }
+
+  .source-page-list {
+    border-right: 1px solid #ebeef5;
+    padding-right: 10px;
+    overflow-y: auto;
+    max-height: 72vh;
+  }
+
+  .source-page-thumb {
+    border: 1px solid #ebeef5;
+    border-radius: 6px;
+    padding: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    background: #fff;
+
+    &.active {
+      border-color: #409eff;
+      background: #ecf5ff;
+    }
+
+    img {
+      width: 100%;
+      height: 130px;
+      object-fit: contain;
+      background: #f5f7fa;
+      border-radius: 4px;
+    }
+  }
+
+  .source-page-thumb-title {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #303133;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .source-page-thumb-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+    margin-top: 5px;
+    color: #909399;
+    font-size: 12px;
+  }
+
+  .source-page-main {
+    min-width: 0;
+  }
+
+  .source-page-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    color: #606266;
+    font-size: 13px;
+  }
+
+  .source-page-image-scroll {
+    height: 68vh;
+    overflow: auto;
+    border: 1px solid #ebeef5;
+    border-radius: 6px;
+    background: #f5f7fa;
+    padding: 12px;
+
+    img {
+      max-width: 100%;
+      display: block;
+      margin: 0 auto;
+    }
+  }
+
+  .standard-reference-box {
+    margin-bottom: 14px;
+    border: 1px solid #e4e7ed;
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: #fafafa;
+
+    .standard-reference-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #303133;
+      margin-bottom: 8px;
+    }
+
+    .standard-reference-text {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      color: #606266;
+      font-size: 13px;
+    }
+  }
+}
+
+.standard-review-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.standard-review-layout {
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr);
+  gap: 12px;
+  min-height: 650px;
+}
+
+.standard-review-list {
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.standard-review-main {
+  min-width: 0;
+}
+
+.standard-review-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+
+.standard-review-title {
+  font-weight: 600;
+  color: #303133;
+  line-height: 1.4;
+}
+
+.standard-review-meta {
+  margin-top: 4px;
+  color: #909399;
+  font-size: 12px;
+}
+
+.standard-review-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.standard-review-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.standard-review-compare {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.9fr) minmax(360px, 1fr);
+  gap: 12px;
+}
+
+.standard-review-image-pane,
+.standard-review-text-pane {
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  background: #fff;
+  min-width: 0;
+}
+
+.standard-review-pane-head {
+  height: 38px;
+  padding: 0 10px;
+  border-bottom: 1px solid #ebeef5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #606266;
+  font-size: 13px;
+}
+
+.standard-review-zoom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.standard-review-image-scroll {
+  height: 600px;
+  overflow: auto;
+  background: #f5f7fa;
+  padding: 10px;
+}
+
+.standard-review-image-scroll img {
+  max-width: 100%;
+  display: block;
+}
+
+.standard-review-text-pane :deep(.el-textarea__inner) {
+  border: none;
+  border-radius: 0 0 6px 6px;
+  font-family: "Menlo", "Consolas", monospace;
+  line-height: 1.7;
+}
+
+.standard-review-empty {
+  border: 1px dashed #dcdfe6;
+  border-radius: 6px;
 }
 
 /* PDF 转换区 */
@@ -3295,6 +5046,12 @@ watch(showAddImagingDialog, (val) => {
       color: #606266;
     }
 
+    .analyze-progress {
+      font-size: 12px;
+      color: #409eff;
+      white-space: nowrap;
+    }
+
     .import-controls {
       display: flex;
       align-items: center;
@@ -3485,6 +5242,13 @@ watch(showAddImagingDialog, (val) => {
             white-space: nowrap;
             display: block;
           }
+
+          .thumb-prediction {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 4px;
+          }
         }
 
         .thumb-actions {
@@ -3505,6 +5269,12 @@ watch(showAddImagingDialog, (val) => {
 
   .pdf-list-view-inner {
     margin-bottom: 8px;
+
+    .prediction-group {
+      margin-left: 6px;
+      color: #909399;
+      font-size: 12px;
+    }
   }
 
   // 导入操作栏
@@ -3594,6 +5364,15 @@ watch(showAddImagingDialog, (val) => {
       }
     }
   }
+}
+
+.move-material-name {
+  display: inline-block;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #606266;
 }
 
 /* 待转换 PDF 列表 */
@@ -3702,6 +5481,7 @@ watch(showAddImagingDialog, (val) => {
             max-width: 400px;
             font-size: 13px;
           }
+          .subtype-tag { flex-shrink: 0; }
         }
         .file-actions { display: flex; gap: 4px; flex-shrink: 0; }
       }
@@ -3743,6 +5523,7 @@ watch(showAddImagingDialog, (val) => {
                 max-width: 360px;
                 font-size: 13px;
               }
+              .subtype-tag { flex-shrink: 0; }
             }
             .file-actions { display: flex; gap: 4px; flex-shrink: 0; }
           }
@@ -3838,6 +5619,23 @@ watch(showAddImagingDialog, (val) => {
 }
 
 /* PDF 查看器控制栏 */
+.pdf-prediction-panel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid #ebeef5;
+  background: #fafafa;
+  font-size: 12px;
+
+  .prediction-reason {
+    color: #606266;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 .pdf-viewer-controls {
   display: flex;
   align-items: center;

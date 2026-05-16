@@ -2,6 +2,7 @@
 PDF 转换工具 - 使用 pdftoppm 将 PDF 分割为 PNG 图片
 """
 import os
+import shutil
 import subprocess
 import uuid
 import json
@@ -37,8 +38,9 @@ class PdfConverter:
             return False, [], f"PDF 文件不存在: {pdf_path}"
 
         # 检查 pdftoppm 是否可用
-        if not self._check_pdftoppm():
-            return False, [], "系统未安装 pdftoppm，请安装 poppler-utils: sudo apt install poppler-utils (Ubuntu) 或 brew install poppler (macOS)"
+        pdftoppm = self._find_pdftoppm()
+        if not pdftoppm:
+            return False, [], "未找到 pdftoppm。macOS 请安装 poppler：brew install poppler；如果已安装，请确认 /opt/homebrew/bin/pdftoppm 或 /usr/local/bin/pdftoppm 存在"
 
         # 生成输出文件名前缀
         prefix = f"case{self.case_id}_{uuid.uuid4().hex[:8]}"
@@ -57,7 +59,7 @@ class PdfConverter:
             # pdftoppm -png -r 150 input.pdf output_prefix
             # 注意：不使用 -singlefile，这样多页 PDF 会生成 prefix-1.png, prefix-2.png 等文件
             cmd = [
-                "pdftoppm",
+                pdftoppm,
                 "-png",           # 输出 PNG 格式
                 "-r", "150",      # 分辨率 150 DPI
                 pdf_path,
@@ -99,13 +101,29 @@ class PdfConverter:
         except Exception as e:
             return False, [], f"转换异常: {str(e)}"
 
-    def _check_pdftoppm(self) -> bool:
-        """检查 pdftoppm 是否可用"""
-        try:
-            result = subprocess.run(["pdftoppm", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
+    def _find_pdftoppm(self) -> Optional[str]:
+        """查找 pdftoppm，兼容后台服务 PATH 不包含 Homebrew 路径的情况。"""
+        candidates = [
+            shutil.which("pdftoppm"),
+            "/opt/homebrew/bin/pdftoppm",
+            "/usr/local/bin/pdftoppm",
+            "/usr/bin/pdftoppm",
+        ]
+        for candidate in candidates:
+            if not candidate or not os.path.exists(candidate):
+                continue
+            try:
+                result = subprocess.run(
+                    [candidate, "-v"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    return candidate
+            except Exception:
+                continue
+        return None
 
     def _extract_page_number(self, filename: str, prefix: str) -> int:
         """从文件名提取页码"""
@@ -151,17 +169,25 @@ class PdfConverter:
                 # 读取元数据获取原始 PDF 文件名
                 meta_path = os.path.join(self.output_dir, prefix + "_meta.json")
                 original_pdf_filename = prefix + ".pdf"  # 默认值
+                source_type = "pdf"
+                original_image_filenames = []
                 if os.path.exists(meta_path):
                     try:
                         with open(meta_path, "r", encoding="utf-8") as mf:
                             meta = json.load(mf)
                             original_pdf_filename = meta.get("original_pdf_filename", original_pdf_filename)
+                            source_type = meta.get("source_type", source_type)
+                            original_image_filenames = meta.get("original_image_filenames", [])
                     except:
                         pass
                 filepath = os.path.join(self.output_dir, f)
+                prefix = match.group(1)
                 pages.append({
+                    "page_number": self._extract_page_number(f, prefix),
                     "filename": f,
                     "original_pdf_filename": original_pdf_filename,
+                    "source_type": source_type,
+                    "original_image_filenames": original_image_filenames,
                     "filepath": filepath,
                     "url": f"/uploads/{self.case_id}/pdf_pages/{f}",
                     "size": os.path.getsize(filepath)

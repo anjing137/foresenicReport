@@ -69,8 +69,10 @@ export default {
     return api.get(`/materials/case/${caseId}`, { params })
   },
   getCaseMaterialsGrouped: (caseId) => api.get(`/materials/case/${caseId}/grouped`),
+  classifyMaterialSubtypes: (caseId) => api.post(`/materials/case/${caseId}/classify-subtypes`),
   deleteMaterial: (id) => api.delete(`/materials/${id}`),
   updateMaterial: (id, data) => api.put(`/materials/${id}`, data),
+  moveMaterial: (id, data) => api.put(`/materials/${id}/move`, data),
   updateOcrText: (id, ocrText) => api.put(`/materials/${id}/ocr-text`, { ocr_text: ocrText }),
 
   // 材料分组
@@ -80,6 +82,7 @@ export default {
     return api.get(`/materials/groups/case/${caseId}`, { params })
   },
   updateMaterialGroup: (groupId, data) => api.put(`/materials/groups/${groupId}`, data),
+  confirmHospitalGroupName: (groupId, data) => api.post(`/materials/groups/${groupId}/confirm-hospital-name`, data),
   deleteMaterialGroup: (groupId) => api.delete(`/materials/groups/${groupId}`),
 
   // ===== PDF 转换 =====
@@ -90,7 +93,25 @@ export default {
       headers: { 'Content-Type': 'multipart/form-data' }
     })
   },
+  uploadImagePages: (caseId, files) => {
+    const formData = new FormData()
+    for (const file of files) {
+      formData.append('files', file)
+    }
+    return api.post(`/materials/upload-image-pages/${caseId}`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+  },
+  uploadDocxMaterial: (caseId, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return api.post(`/materials/upload-docx/${caseId}`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+  },
   getPdfPages: (caseId) => api.get(`/materials/case/${caseId}/pdf-pages`),
+  analyzePdfPages: (caseId, data = {}) => api.post(`/materials/case/${caseId}/pdf-pages/analyze`, data, { timeout: 30 * 60 * 1000 }),
+  autoImportPdfPages: (caseId, data = {}) => api.post(`/materials/case/${caseId}/pdf-pages/auto-import`, data, { timeout: 30 * 60 * 1000 }),
   deletePdfPage: (caseId, filename) => api.delete(`/materials/pdf-page/${caseId}/${encodeURIComponent(filename)}`),
   deletePdf: (caseId, prefix) => api.delete(`/materials/pdf/${caseId}/${encodeURIComponent(prefix)}`),
   importPdfPages: (caseId, data) => api.post(`/materials/import-pdf-pages/${caseId}`, data),
@@ -103,12 +124,20 @@ export default {
 
   // ===== 住院记录 =====
   getHospitalRecords: (caseId) => api.get(`/hospital-records/case/${caseId}`),
+  getHospitalRecordSourcePages: (id) => api.get(`/hospital-records/${id}/source-pages`),
   createHospitalRecord: (data) => api.post('/hospital-records', data),
   updateHospitalRecord: (id, data) => api.put(`/hospital-records/${id}`, data),
   deleteHospitalRecord: (id) => api.delete(`/hospital-records/${id}`),
 
+  // ===== 病历事件型事实 =====
+  getMedicalEvents: (caseId) => api.get(`/medical-events/case/${caseId}`),
+  getMedicalEventSourcePages: (id) => api.get(`/medical-events/${id}/source-pages`),
+  updateMedicalEvent: (id, data) => api.put(`/medical-events/${id}`, data),
+  deleteMedicalEvent: (id) => api.delete(`/medical-events/${id}`),
+
   // ===== 影像学报告 =====
   getImagingReports: (caseId) => api.get(`/imaging-reports/case/${caseId}`),
+  getImagingReportSourcePages: (id) => api.get(`/imaging-reports/${id}/source-pages`),
   createImagingReport: (data) => api.post('/imaging-reports', data),
   updateImagingReport: (id, data) => api.put(`/imaging-reports/${id}`, data),
   deleteImagingReport: (id) => api.delete(`/imaging-reports/${id}`),
@@ -126,6 +155,16 @@ export default {
   createStyleLog: (data) => api.post('/style-logs', data),
   getStyleStats: () => api.get('/style-logs/stats'),
 
+  // ===== 规范依据库 =====
+  getStandards: () => api.get('/standards'),
+  importStandards: (data = {}) => api.post('/standards/import', data, { timeout: 10 * 60 * 1000 }),
+  startStandardsOcr: (data = {}) => api.post('/standards/ocr/start', data, { timeout: 300000 }),
+  getStandardsOcrStatus: () => api.get('/standards/ocr/status'),
+  getStandardReviewPages: (params = {}) => api.get('/standards/review-pages', { params }),
+  updateStandardReviewPage: (pageId, data) => api.put(`/standards/pages/${pageId}/proofread`, data),
+  searchStandards: (q, limit = 8) => api.get('/standards/search', { params: { q, limit } }),
+  getCaseStandardReferences: (caseId, limit = 8) => api.get(`/standards/case/${caseId}/references`, { params: { limit } }),
+
   // ===== LLM 智能提取 =====
   // 全局提取（旧接口，保留兼容）
   extractAll: (caseId) => api.post(`/llm/cases/${caseId}/extract-all`),
@@ -133,15 +172,16 @@ export default {
   // 按页面提取（新接口）
   extractBasicInfo: (caseId) => api.post(`/llm/cases/${caseId}/extract-basic-info`),
   extractCaseFacts: (caseId) => api.post(`/llm/cases/${caseId}/extract-case-facts`),
-  extractMedicalRecords: (caseId) => api.post(`/llm/cases/${caseId}/extract-medical-records`),
+  extractMedicalRecords: (caseId) => api.post(`/llm/cases/${caseId}/extract-medical-records`, null, { timeout: 30 * 60 * 1000 }),
   // 病历按医院分组提取
   getMedicalGroups: (caseId) => api.get(`/llm/cases/${caseId}/medical-groups`),
-  extractMedicalGroup: (caseId, groupId) => api.post(`/llm/cases/${caseId}/extract-medical-group/${groupId}`),
-  generateMaterialSummary: (caseId) => api.post(`/llm/cases/${caseId}/generate-material-summary`),
+  extractMedicalGroup: (caseId, groupId) => api.post(`/llm/cases/${caseId}/extract-medical-group/${groupId}`, null, { timeout: 30 * 60 * 1000 }),
+  generateMaterialSummary: (caseId) => api.post(`/llm/cases/${caseId}/generate-material-summary`, null, { timeout: 10 * 60 * 1000 }),
   generateAppraisalProcess: (caseId) => api.post(`/llm/cases/${caseId}/generate-appraisal-process`),
   extractImagingReports: (caseId) => api.post(`/llm/cases/${caseId}/extract-imaging-reports`),
   generateAnalysis: (caseId) => api.post(`/llm/cases/${caseId}/generate-analysis`),
   generateOpinion: (caseId) => api.post(`/llm/cases/${caseId}/generate-opinion`),
+  generateFullReport: (caseId) => api.post(`/llm/cases/${caseId}/generate-full-report`, null, { timeout: 10 * 60 * 1000 }),
 
   // ===== 系统配置 =====
   getAppraiser: () => api.get('/settings/appraiser'),

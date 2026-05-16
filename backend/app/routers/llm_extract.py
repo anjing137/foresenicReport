@@ -14,7 +14,10 @@ from app.models.case import (
     Case, CaseStatus, Material, MaterialGroup, MaterialType, OcrStatus,
     Person, HospitalRecord, ImagingReport, Report,
 )
-from app.utils.llm import extract_fields, extract_case_summary, call_llm, extract_medical_group_fields
+from app.utils.llm import (
+    extract_fields, extract_case_summary, call_llm, extract_medical_group_fields,
+    call_llm_json_harness, call_llm_text_harness,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1390,127 +1393,217 @@ def _generate_material_summary(case_id: int, db) -> dict:
     return {"success": True, "material_summary": summary_text}
 
 
-def _generate_appraisal_process(case_id: int, db) -> dict:
-    """使用 LLM 生成鉴定过程文本，LLM失败时回退到拼接（fallback）"""
-    from app.utils.llm import call_llm
+def _generate_imaging_review(imaging_data: list[dict], person_name: str,
+                              surgery_context: str = "") -> str:
+    """Python 控制格式（日期/医院/换行），LLM 只凝练报告内容为 1-2 句关键发现"""
+    if not imaging_data:
+        return ""
 
+    # Python 构建每条的前缀（保持检查事实的原始顺序）
+    prefixes = []
+    raw_contents = []
+    for idx, r in enumerate(imaging_data):
+        hospital = r.get("医院名称") or "某医院"
+        exam_part = r.get("检查部位") or ""
+        exam_type = r.get("检查类型") or ""
+        film_number = r.get("片子编号") or ""
+        date = r.get("报告日期") or ""
+        film_str = f"（号{film_number}）" if film_number else ""
+        prefix = f"复阅{date}{hospital}{person_name}{exam_part}{exam_type}片{film_str}示："
+        prefixes.append(prefix)
+        raw_contents.append({
+            "序号": idx,
+            "原始报告": (r.get("报告内容") or "")[:300],
+        })
+
+    # LLM 凝练
+    prompt = f"""你是法医临床学鉴定人。请将以下影像学报告各自凝练为1-2句关键发现。
+{surgery_context}
+要求：
+- findings数组必须与报告列表一一对应，长度相同，不可增减条目
+- 有阳性发现的保留阳性描述，无可凝练内容的填"无特殊发现"
+- 影像诊断与出院诊断矛盾时以出院诊断为准
+
+报告列表：
+{json.dumps(raw_contents, ensure_ascii=False, indent=2)}
+
+返回JSON，findings数组长度必须为{len(raw_contents)}："""
+
+    result = call_llm_json_harness(
+        task_name="condense_imaging",
+        system_prompt="你是法医临床学鉴定人。只输出JSON。",
+        instructions=prompt,
+        input_text=json.dumps(raw_contents, ensure_ascii=False),
+        output_schema='{"findings": ["发现1", "发现2"]}',
+        required_fields=["findings"],
+        temperature=0.0,
+        max_tokens=3000,
+        max_input_chars=12000,
+        max_retries=1,
+    )
+
+    if result.get("success") and result.get("data", {}).get("findings"):
+        findings = result["data"]["findings"]
+    else:
+        findings = [(r.get("报告内容") or "")[:150] for r in imaging_data]
+
+    lines = []
+    for i, prefix in enumerate(prefixes):
+        finding = str(findings[i] if i < len(findings) else "").rstrip("。；;，, ").strip()
+        # 跳过无效发现
+        if not finding or finding.lower() in ("none", "null", "无", "未见异常", "无特殊发现"):
+            continue
+        lines.append(f"{prefix}{finding}。")
+    return "\n".join(lines)
+
+
+def _generate_appraisal_process(case_id: int, db) -> dict:
+    """生成鉴定过程：Python控制影像格式+LLM凝练报告内容；临床检查医生写了直接用，没写LLM推断"""
     img_reports = db.query(ImagingReport).filter(ImagingReport.case_id == case_id).all()
     case = db.query(Case).filter(Case.id == case_id).first()
     person = db.query(Person).filter(Person.case_id == case_id).first()
+    records = db.query(HospitalRecord).filter(HospitalRecord.case_id == case_id).all()
 
     if not case:
         return {"success": False, "error": "案件不存在"}
 
     person_name = person.name if person and person.name else "被鉴定人"
+    exam_date = case.examination_date or ""
+    clinical_examination = case.clinical_examination or ""
+    accident_date = case.accident_date or ""
 
-    # ===== 尝试 LLM 生成 =====
+    # 手术/出院诊断为金标准
+    surgery_context = ""
+    if records:
+        diag_parts = []
+        for r in records:
+            if r.discharge_diagnosis:
+                diag_parts.append(f"【{r.hospital_name or '某医院'}出院诊断】{r.discharge_diagnosis}")
+            if r.treatment_process and any(kw in (r.treatment_process or "") for kw in ("手术", "探查", "切除", "修补", "置换", "内固定")):
+                diag_parts.append(f"【{r.hospital_name or '某医院'}手术经过】{(r.treatment_process or '')[:300]}")
+        if diag_parts:
+            surgery_context = f"出院诊断和手术记录为金标准。如影像报告中的诊断与出院诊断不一致，必须以出院诊断为准。\n" + "\n".join(diag_parts)
+
+    # 构建影像数据（粗筛：去血管超声、肌电图、鼻咽喉镜、正常监测类）
+    _SKIP_TYPES = {"emg_report", "nasopharyngoscopy", "hearing_test", "eeg", "nerve_conduction"}
     imaging_data = []
     for r in img_reports:
-        item = {
+        rtype = (r.exam_type or "").lower().strip()
+        ep = (r.exam_part or "").lower()
+        rc = (r.report_content or "").lower()
+        # 明确无关检查类型
+        if rtype in _SKIP_TYPES:
+            continue
+        # 血管多普勒超声/血栓监测（并发症，非事故直接损伤）
+        _vascular_kw = ("静脉", "动脉", "动静脉", "血栓", "深静脉", "肌间静脉", "腓静脉")
+        if any(m in ep for m in _vascular_kw) or any(m in rc[:120] for m in _vascular_kw):
+            continue
+        # 超声/彩超类检查（除脏器超声如肝胆脾胰外，血管监测类跳过）
+        if any(m in rtype for m in ("超声", "彩超", "ultrasound")) and \
+           not any(m in ep for m in ("肝", "胆", "脾", "胰", "肾", "腹", "心脏", "心")):
+            continue
+        # 无诊断意义：报告尚未完成、正常且无阳性发现
+        pending = any(m in rc for m in ("未完成审核", "尚未上传", "尚未完成", "待审核", "未审核"))
+        if pending and not any(m in rc for m in ("骨折", "损伤", "出血", "血肿", "断裂", "置换", "术后", "内固定", "缺如", "缺失")):
+            continue
+        normal = any(m in rc for m in ("未见明显异常", "未见异常", "未见明确"))
+        positive = any(m in rc for m in ("骨折", "损伤", "出血", "血肿", "断裂", "置换", "术后", "内固定", "缺如", "缺失"))
+        if normal and not positive:
+            continue
+        imaging_data.append({
             "报告日期": r.report_date or "",
             "医院名称": r.hospital_name or "",
             "检查类型": r.exam_type or "",
             "检查部位": r.exam_part or "",
             "片子编号": r.film_number or "",
-            "片子数量": r.film_count or "",
             "报告内容": r.report_content or "",
-        }
-        imaging_data.append(item)
+        })
 
-    exam_date = case.examination_date or ""
-    clinical_examination = case.clinical_examination or ""
+    # 计算伤后时间
+    from datetime import datetime as dt
+    time_since = ""
+    if accident_date and exam_date:
+        try:
+            d1 = dt.strptime(accident_date[:10], "%Y-%m-%d" if "-" in accident_date[:10] else "%Y年%m月%d日")
+            d2 = dt.strptime(exam_date[:10], "%Y-%m-%d" if "-" in exam_date[:10] else "%Y年%m月%d日")
+            delta = (d2 - d1).days
+            if delta >= 0:
+                if delta < 30:
+                    time_since = f"伤后{delta}日"
+                else:
+                    months = delta // 30
+                    remain = delta % 30
+                    time_since = f"伤后{months}个月余" if remain < 25 else f"伤后{months + 1}个月"
+        except (ValueError, IndexError):
+            pass
 
-    system_prompt = """你是一位资深法医临床学鉴定人，擅长撰写司法鉴定意见书中的"鉴定过程"部分。
-请严格按照司法鉴定意见书的规范格式生成文本。"""
+    has_imaging = len(imaging_data) > 0
+    has_clinical = bool(clinical_examination.strip())
 
-    user_prompt = f"""请根据以下案件信息，撰写司法鉴定意见书的"鉴定过程"部分。
+    # 标准开头
+    opening_standard = (
+        "按照《法医临床检验规范》（SF/Z JD0103003-2011）和《法医临床影像学检验实施规范》（SF/Z JD0103006-2014）"
+        if has_imaging else
+        "按照《法医临床检验规范》（SF/Z JD0103003-2011）"
+    )
+    opening = f"{opening_standard}对{person_name}进行法医临床学检查。"
+
+    # 日期格式化
+    display_date = exam_date
+    if exam_date and "-" in exam_date:
+        parts_date = exam_date.split(" ")[0].split("-")
+        if len(parts_date) == 3:
+            display_date = f"{parts_date[0]}年{parts_date[1]}月{parts_date[2]}日"
+
+    # 日期/伤后时间
+    date_line = ""
+    if display_date or time_since:
+        date_part = f"{display_date}，" if display_date else ""
+        time_part = f"即被鉴定人{person_name}{time_since}。" if time_since else ""
+        date_line = f"{date_part}{time_part}"
+
+    # 影像复阅：Python格式 + LLM凝练
+    imaging_review = _generate_imaging_review(imaging_data, person_name, surgery_context)
+
+    # 临床检查
+    if has_clinical:
+        clinical_text = clinical_examination.strip()
+    else:
+        clinical_text = ""
+        if imaging_data:
+            prompt = f"""你是法医临床学鉴定人。请根据以下信息撰写鉴定过程里的临床检查部分。
 
 被鉴定人：{person_name}
-检查日期：{exam_date}
-法医临床学检查内容：{clinical_examination}
+检查日期：{display_date}
+伤后时间：{time_since}
+以下影像学报告中有阳性发现的关键条目（用于推断查体所见）：
+{chr(10).join(f"- {r.get('检查部位','')}{r.get('检查类型','')}: {(r.get('报告内容','') or '')[:120]}" for r in imaging_data[:15])}
 
-影像学报告数据（共{len(img_reports)}份）：
-{json.dumps(imaging_data, ensure_ascii=False, indent=2)}
+要求：写"{person_name}自行步入诊室。神志清晰，查体合作。"写"自诉："后跟1-2句核心症状。写"查体："后跟5-6句，只描述阳性体征：手术瘢痕位置及长度、局部压痛、畸形、活动受限等，不写关节活动度度数，不写特殊试验名称。以"四肢肌力及肌张力正常，余查体未见明显异常。"收尾。连续行文不另起标题。只输出临床检查文本。"""
+            result = call_llm_text_harness(
+                task_name="clinical_exam",
+                system_prompt="你是法医临床学鉴定人。只输出临床检查文本。",
+                instructions=prompt,
+                temperature=0.3,
+                max_tokens=1500,
+                max_input_chars=8000,
+                max_retries=1,
+            )
+            if result.get("success"):
+                clinical_text = result["content"].strip()
 
-要求：
-1. 鉴定过程分为两部分：
-   第一部分：法医临床学检查
-   - 以"按照《法医临床检验规范》（SF/Z JD0103003-2011）对{person_name}进行法医临床学检查。"开头
-   - 如果有检查日期，写明日期
-   - 然后是检查内容（如被鉴定人伤后多久、自行步入诊室、自诉症状、查体结果等）
+    # 组装
+    parts = [opening]
+    if date_line:
+        parts.append(date_line)
+    if clinical_text:
+        parts.append(clinical_text)
+    if imaging_review:
+        parts.append(imaging_review)
+    process_text = "\n\n".join(parts)
 
-   第二部分：影像学资料复阅
-   - 每份影像报告一行，格式为：复阅 日期 医院 姓名 部位+类型片（号XX）示：描述
-   - 例如：复阅 2021年4月22日 新乡市中心医院 张金遂 头颅CT片（号12345）示：左侧颞叶挫裂伤
-   - 部位和检查类型合并，如"头颅CT片""左锁骨正位X线片""胸部正位X线片"
-
-2. 语言规范严谨，符合司法鉴定文书格式
-3. 不要加"一、""二、"等编号，不要加小标题
-4. 只输出鉴定过程正文，不要加标题、不要加说明性文字
-5. 影像学报告的描述内容要完整保留，不要缩写或省略"""
-
-    llm_result = call_llm(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=0.3,
-        max_tokens=2000,
-    )
-
-    if llm_result.get("success"):
-        process_text = llm_result["content"].strip()
-        # 去除 LLM 返回的 markdown 代码块标记
-        if process_text.startswith("```"):
-            lines = process_text.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            process_text = "\n".join(lines).strip()
-        logger.info(f"案件 {case_id} 鉴定过程 LLM 生成成功")
-        return {"success": True, "appraisal_process": process_text, "method": "llm"}
-
-    # ===== Fallback：LLM 失败，回退到拼接 =====
-    logger.warning(f"案件 {case_id} 鉴定过程 LLM 生成失败（{llm_result.get('error')}），回退到拼接模式")
-    process_parts = []
-
-    # 一、法医临床学检查
-    if clinical_examination:
-        process_parts.append(
-            f"按照《法医临床检验规范》（SF/Z JD0103003-2011）对{person_name}进行法医临床学检查。"
-        )
-        if exam_date:
-            process_parts.append(f"{exam_date}。")
-        process_parts.append(clinical_examination)
-
-    # 二、影像学资料复阅
-    if img_reports:
-        for r in img_reports:
-            hospital = r.hospital_name or "某医院"
-            exam_type = r.exam_type or "影像学检查"
-            exam_part = r.exam_part or ""
-            date = r.report_date or ""
-            content = r.report_content or ""
-            film_info = f"（号 {r.film_number}）" if r.film_number else ""
-
-            parts = ["复阅"]
-            if date:
-                parts.append(date)
-            parts.append(hospital)
-            if person_name:
-                parts.append(person_name)
-            if exam_part and exam_type:
-                parts.append(f"{exam_part}{exam_type}片")
-            elif exam_type:
-                parts.append(f"{exam_type}片")
-            parts.append(film_info)
-            parts.append("示：")
-            parts.append(content)
-
-            line = " ".join(parts).replace("  ", " ").strip()
-            process_parts.append(line)
-
-    process_text = "\n".join(process_parts)
-    return {"success": True, "appraisal_process": process_text, "method": "fallback"}
+    logger.info(f"案件 {case_id} 鉴定过程生成成功（影像 {len(img_reports)}→{len(imaging_data)} 条）")
+    return {"success": True, "appraisal_process": process_text, "method": "llm"}
 
 
 def _generate_analysis(case_id: int, db) -> dict:

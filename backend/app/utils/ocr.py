@@ -1,6 +1,7 @@
 """
-OCR 识别工具 - 使用硅基流动 PaddleOCR-VL API
-通过 PaddleOCRVL 客户端调用，免费、高精度
+OCR 识别工具
+
+默认使用硅基流动 PaddleOCR-VL；当 OCR_BACKEND=local 时，使用本机 PaddleOCR。
 """
 import os
 import logging
@@ -17,6 +18,7 @@ IMAGE_BLOCK_LABELS = {'image', 'header_image', 'figure', 'seal', 'stamp', 'chart
 
 # 模块级 OCR 实例缓存
 _ocr_pipeline = None
+_local_ocr_pipeline = None
 
 
 def _get_ocr_pipeline():
@@ -45,6 +47,95 @@ def _get_ocr_pipeline():
     return _ocr_pipeline
 
 
+def _get_local_ocr_pipeline():
+    """获取或创建本地 PaddleOCR 实例。"""
+    global _local_ocr_pipeline
+    if _local_ocr_pipeline is not None:
+        return _local_ocr_pipeline
+
+    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
+    from paddleocr import PaddleOCR
+
+    logger.info("正在初始化本地 PaddleOCR pipeline...")
+    _local_ocr_pipeline = PaddleOCR(
+        lang=settings.LOCAL_OCR_LANG,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        text_det_limit_side_len=settings.LOCAL_OCR_DET_LIMIT_SIDE_LEN,
+        text_det_limit_type="max",
+        text_recognition_batch_size=8,
+    )
+    logger.info("本地 PaddleOCR pipeline 初始化完成")
+    return _local_ocr_pipeline
+
+
+def _result_json(res):
+    data = getattr(res, "json", None)
+    if callable(data):
+        data = data()
+    if isinstance(data, dict):
+        return data
+    if isinstance(res, dict):
+        return res
+    return {}
+
+
+def _save_text_result(image_path: str, save_dir: str | None, full_text: str) -> str | None:
+    if not save_dir:
+        return None
+    os.makedirs(save_dir, exist_ok=True)
+    stem = Path(image_path).stem
+    md_path = os.path.join(save_dir, f"{stem}.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(full_text)
+    logger.info(f"OCR 结果已保存: {md_path}")
+    return md_path
+
+
+def run_local_ocr(image_path: str, save_dir: str = None) -> Dict[str, Any]:
+    """使用本机 PaddleOCR 识别图片文字。"""
+    try:
+        pipeline = _get_local_ocr_pipeline()
+        output = pipeline.predict(input=image_path)
+        texts = []
+        blocks = []
+
+        for res in output:
+            data = _result_json(res)
+            inner = data.get("res") or data
+            rec_texts = inner.get("rec_texts") or inner.get("texts") or []
+            rec_scores = inner.get("rec_scores") or []
+            if isinstance(rec_texts, list):
+                for idx, text in enumerate(rec_texts):
+                    content = str(text).strip()
+                    if not content:
+                        continue
+                    texts.append(content)
+                    block = {"label": "text", "content": content}
+                    if idx < len(rec_scores):
+                        block["score"] = rec_scores[idx]
+                    blocks.append(block)
+
+        full_text = "\n".join(texts).strip()
+        if not full_text:
+            return {"success": False, "error": "本地 PaddleOCR 返回空结果"}
+
+        md_path = _save_text_result(image_path, save_dir, full_text)
+        return {
+            "success": True,
+            "text": full_text,
+            "blocks": blocks,
+            "md_path": md_path,
+            "cropped_images": [],
+            "backend": "local",
+        }
+    except Exception as e:
+        logger.exception("本地 PaddleOCR 识别失败")
+        return {"success": False, "error": f"本地 PaddleOCR 识别失败: {e}"}
+
+
 def run_ocr(image_path: str, save_dir: str = None) -> Dict[str, Any]:
     """
     调用硅基流动 PaddleOCR-VL 识别图片文字
@@ -57,10 +148,16 @@ def run_ocr(image_path: str, save_dir: str = None) -> Dict[str, Any]:
         {"success": True, "text": "识别文本(Markdown)", "blocks": [...], "md_path": "...", "cropped_images": [...]}
         或 {"success": False, "error": "错误信息"}
     """
+    global _ocr_pipeline
+
     if not os.path.exists(image_path):
         return {"success": False, "error": f"文件不存在: {image_path}"}
 
+    if (settings.OCR_BACKEND or "siliconflow").lower() == "local":
+        return run_local_ocr(image_path, save_dir)
+
     max_retries = 3
+    last_error = ""
     for attempt in range(max_retries):
         try:
             pipeline = _get_ocr_pipeline()
@@ -279,15 +376,21 @@ def run_ocr(image_path: str, save_dir: str = None) -> Dict[str, Any]:
 
         except Exception as e:
             error_msg = str(e)
+            last_error = error_msg
             logger.warning(f"OCR 异常: {error_msg}，第 {attempt + 1} 次重试...")
             if "401" in error_msg or "Unauthorized" in error_msg:
                 return {"success": False, "error": "API Key 无效，请检查 SILICONFLOW_API_KEY 配置"}
             if "429" in error_msg or "rate" in error_msg.lower():
                 time.sleep(5)
+            elif "Connection error" in error_msg or "worker" in error_msg:
+                _ocr_pipeline = None
+                if attempt < max_retries - 1:
+                    time.sleep(2)
             elif attempt < max_retries - 1:
                 time.sleep(2)
 
-    return {"success": False, "error": f"OCR 识别失败（已重试 {max_retries} 次）"}
+    detail = f"：{last_error}" if last_error else ""
+    return {"success": False, "error": f"OCR 识别失败（已重试 {max_retries} 次）{detail}"}
 
 
 def extract_text_from_result(ocr_result: Dict[str, Any]) -> str:

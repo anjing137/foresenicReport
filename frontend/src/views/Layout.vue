@@ -52,7 +52,7 @@
           <el-input v-model="appraiserForm.title" placeholder="如：副教授、主任法医师" />
         </el-form-item>
         <el-form-item label="工作单位">
-          <el-input v-model="appraiserForm.unit" placeholder="如：新乡医学院司法鉴定中心" />
+          <el-input v-model="appraiserForm.unit" placeholder="如：河南医药大学司法鉴定中心" />
         </el-form-item>
       </el-form>
       <template #footer>

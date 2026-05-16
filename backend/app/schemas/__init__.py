@@ -6,6 +6,7 @@ from app.schemas.case import (
     PersonCreate, PersonUpdate, PersonResponse,
     MaterialCreate, MaterialUpdate, MaterialResponse,
     HospitalRecordCreate, HospitalRecordUpdate, HospitalRecordResponse,
+    MedicalEventCreate, MedicalEventUpdate, MedicalEventResponse,
     ImagingReportCreate, ImagingReportUpdate, ImagingReportResponse,
     ReportCreate, ReportUpdate, ReportResponse,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "PersonCreate", "PersonUpdate", "PersonResponse",
     "MaterialCreate", "MaterialUpdate", "MaterialResponse",
     "HospitalRecordCreate", "HospitalRecordUpdate", "HospitalRecordResponse",
+    "MedicalEventCreate", "MedicalEventUpdate", "MedicalEventResponse",
     "ImagingReportCreate", "ImagingReportUpdate", "ImagingReportResponse",
     "ReportCreate", "ReportUpdate", "ReportResponse",
 ]

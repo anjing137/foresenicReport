@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from app.database import get_db, SessionLocal
-from app.models.case import Case, CaseStatus, MaterialType, MaterialGroup, Person, Material, OcrStatus
+from app.models.case import Case, CaseStatus, MaterialType, MaterialGroup, Person, Material, MedicalEvent, OcrStatus
 
 # 停止请求存储：key=case_id, value="stop"(等当前完)|"force"(强制立刻停)
 _stop_flags: dict[int, str] = {}
@@ -24,6 +24,8 @@ from app.schemas.case import (
 )
 from app.utils.ocr import run_ocr, extract_text_from_result
 from app.config import settings
+from app.utils.material_classifier import classify_material_subtype, get_material_subtype_label
+from app.utils.source_material import material_original_page_number, material_sequence_key, source_for_record, source_material_payload
 
 router = APIRouter(prefix="/api/cases", tags=["案件管理"])
 logger = logging.getLogger(__name__)
@@ -35,6 +37,30 @@ def get_status_label(status: str) -> str:
 
 def get_material_type_label(material_type: str) -> str:
     return MaterialType.LABELS.get(material_type, material_type)
+
+
+EVENT_TYPE_ORDER = {
+    "admission": 10,
+    "diagnosis": 20,
+    "exam": 30,
+    "surgery": 40,
+    "treatment": 50,
+    "progress": 60,
+    "medication": 70,
+    "consultation": 80,
+    "discharge": 90,
+    "other": 100,
+}
+
+
+def _medical_event_sort_key(event: MedicalEvent) -> tuple:
+    raw_date = event.event_date or "9999-99-99 99:99"
+    return (
+        raw_date[:10],
+        EVENT_TYPE_ORDER.get(event.event_type or "other", 100),
+        raw_date,
+        event.id or 0,
+    )
 
 
 def _material_counts(db: Session, case_id: int) -> dict:
@@ -151,6 +177,7 @@ def _run_ocr_task(case_id: int, material_ids: List[int], task_id: str) -> None:
                 if text:
                     material.ocr_text = text
                     material.ocr_status = OcrStatus.COMPLETED
+                    material.material_subtype = classify_material_subtype(material.material_type, text)
                     if result.get("md_path"):
                         material.ocr_file_path = result["md_path"]
                     db.commit()
@@ -162,14 +189,15 @@ def _run_ocr_task(case_id: int, material_ids: List[int], task_id: str) -> None:
                     })
                     _increment_task_progress(case_id, completed=1)
                 else:
-                    material.ocr_text = ""
+                    error_message = result.get("error", "无识别结果")
+                    material.ocr_text = f"OCR失败: {error_message}"
                     material.ocr_status = OcrStatus.FAILED
                     db.commit()
                     _append_task_result(case_id, {
                         "material_id": material.id,
                         "filename": material.original_filename,
                         "status": "failed",
-                        "error": result.get("error", "无识别结果"),
+                        "error": error_message,
                     })
                     _increment_task_progress(case_id, failed=1)
             except Exception as e:
@@ -333,15 +361,18 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
         )
 
     materials_data = []
-    for m in case.materials:
+    for m in sorted(case.materials, key=material_sequence_key):
         materials_data.append({
             "id": m.id,
             "case_id": m.case_id,
             "material_type": m.material_type,
             "material_type_label": get_material_type_label(m.material_type),
+            "material_subtype": m.material_subtype,
+            "material_subtype_label": get_material_subtype_label(m.material_subtype),
             "group_id": m.group_id,
             "description": m.description,
             "page_number": m.page_number,
+            "original_page_number": material_original_page_number(m),
             "file_path": m.file_path,
             "original_filename": m.original_filename,
             "ocr_text": m.ocr_text,
@@ -357,15 +388,18 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
             "material_type": mg.material_type,
             "group_name": mg.group_name,
             "sort_order": mg.sort_order,
+            "is_confirmed": bool(mg.is_confirmed),
             "created_at": mg.created_at,
             "materials": [md for md in materials_data if md.get("group_id") == mg.id],
         })
 
     hospital_records_data = []
     for hr in case.hospital_records:
+        source_material, source_count = source_for_record(db, hr.material_id, hr.group_id)
         hospital_records_data.append({
             "id": hr.id,
             "case_id": hr.case_id,
+            "group_id": hr.group_id,
             "material_id": hr.material_id,
             "hospital_name": hr.hospital_name,
             "admission_number": hr.admission_number,
@@ -381,21 +415,65 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
             "admission_date": hr.admission_date,
             "discharge_date": hr.discharge_date,
             "hospital_days": hr.hospital_days,
+            "review_status": hr.review_status or "pending",
+            "extraction_confidence": hr.extraction_confidence,
+            "quality_flags": hr.quality_flags,
+            **source_material_payload(source_material, source_count),
+        })
+
+    medical_events_data = []
+    events = db.query(MedicalEvent).filter(
+        MedicalEvent.case_id == case.id,
+    ).all()
+    events = sorted(events, key=_medical_event_sort_key)
+    for event in events:
+        medical_events_data.append({
+            "id": event.id,
+            "case_id": event.case_id,
+            "group_id": event.group_id,
+            "hospital_record_id": event.hospital_record_id,
+            "hospital_name": event.hospital_name,
+            "event_type": event.event_type,
+            "event_date": event.event_date,
+            "title": event.title,
+            "summary": event.summary,
+            "diagnosis": event.diagnosis,
+            "findings": event.findings,
+            "treatment": event.treatment,
+            "source_quote": event.source_quote,
+            "material_subtype": event.material_subtype,
+            "source_material_ids": event.source_material_ids,
+            "source_page_numbers": event.source_page_numbers,
+            "review_status": event.review_status or "pending",
+            "extraction_confidence": event.extraction_confidence,
+            "quality_flags": event.quality_flags,
+            "created_at": event.created_at,
+            "updated_at": event.updated_at,
         })
 
     imaging_reports_data = []
-    for ir in case.imaging_reports:
+    sorted_reports = sorted(case.imaging_reports, key=lambda r: r.report_datetime or "9999-12-31T23:59:59")
+    for ir in sorted_reports:
+        source_material, source_count = source_for_record(db, ir.material_id)
         imaging_reports_data.append({
             "id": ir.id,
             "case_id": ir.case_id,
+            "group_id": ir.group_id,
             "material_id": ir.material_id,
             "report_date": ir.report_date,
+            "report_datetime": ir.report_datetime,
             "hospital_name": ir.hospital_name,
             "exam_type": ir.exam_type,
             "exam_part": ir.exam_part,
             "film_number": ir.film_number,
             "film_count": ir.film_count,
             "report_content": ir.report_content,
+            "review_status": ir.review_status or "pending",
+            "extraction_confidence": ir.extraction_confidence,
+            "quality_flags": ir.quality_flags,
+            "source_material_ids": ir.source_material_ids,
+            "source_page_numbers": ir.source_page_numbers,
+            **source_material_payload(source_material, source_count),
         })
 
     report_data = None
@@ -438,6 +516,7 @@ def get_case(case_id: int, db: Session = Depends(get_db)):
         materials=materials_data,
         material_groups=material_groups_data,
         hospital_records=hospital_records_data,
+        medical_events=medical_events_data,
         imaging_reports=imaging_reports_data,
         report=report_data,
     )
@@ -632,12 +711,16 @@ def recognize_single_material(case_id: int, material_id: int, db: Session = Depe
     save_dir = os.path.join(str(settings.UPLOAD_DIR), str(case_id), "ocr_result")
 
     try:
+        material.ocr_status = OcrStatus.PROCESSING
+        db.commit()
+
         result = run_ocr(material.file_path, save_dir=save_dir)
         text = extract_text_from_result(result)
 
         if text:
             material.ocr_text = text
             material.ocr_status = OcrStatus.COMPLETED
+            material.material_subtype = classify_material_subtype(material.material_type, text)
             if result.get("md_path"):
                 material.ocr_file_path = result["md_path"]
             db.commit()
@@ -649,14 +732,15 @@ def recognize_single_material(case_id: int, material_id: int, db: Session = Depe
                 "text_preview": text[:200],
             }
         else:
-            material.ocr_text = ""
+            error_message = result.get("error", "无识别结果")
+            material.ocr_text = f"OCR失败: {error_message}"
             material.ocr_status = OcrStatus.FAILED
             db.commit()
             return {
                 "message": f"识别失败: {material.original_filename}",
                 "material_id": material_id,
                 "status": "failed",
-                "error": result.get("error", "无识别结果"),
+                "error": error_message,
             }
     except Exception as e:
         material.ocr_text = f"OCR错误: {str(e)}"

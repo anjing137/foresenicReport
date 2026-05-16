@@ -43,7 +43,7 @@ class MaterialTypeEnum:
         "appraisal_application": "鉴定申请书",
         "litigation_material": "诉讼材料",
         "medical_record": "医院病历",
-        "imaging_report": "影像学报告",
+        "imaging_report": "检查报告",
     }
 
 
@@ -125,6 +125,7 @@ class CaseResponse(BaseModel):
     materials: List["MaterialResponse"] = []
     material_groups: List["MaterialGroupResponse"] = []
     hospital_records: List["HospitalRecordResponse"] = []
+    medical_events: List["MedicalEventResponse"] = []
     imaging_reports: List["ImagingReportResponse"] = []
     report: Optional["ReportResponse"] = None
 
@@ -153,6 +154,7 @@ class MaterialGroupBase(BaseModel):
     material_type: str
     group_name: str
     sort_order: Optional[int] = 0
+    is_confirmed: Optional[bool] = False
 
 
 class MaterialGroupCreate(MaterialGroupBase):
@@ -162,6 +164,7 @@ class MaterialGroupCreate(MaterialGroupBase):
 class MaterialGroupUpdate(BaseModel):
     group_name: Optional[str] = None
     sort_order: Optional[int] = None
+    is_confirmed: Optional[bool] = None
 
 
 class MaterialGroupResponse(MaterialGroupBase):
@@ -191,6 +194,7 @@ class MaterialCreate(MaterialBase):
 
 class MaterialUpdate(BaseModel):
     material_type: Optional[str] = None
+    material_subtype: Optional[str] = None
     group_id: Optional[int] = None
     description: Optional[str] = None
     page_number: Optional[int] = None
@@ -203,9 +207,12 @@ class MaterialResponse(BaseModel):
     case_id: int
     material_type: str
     material_type_label: Optional[str] = None
+    material_subtype: Optional[str] = None
+    material_subtype_label: Optional[str] = None
     group_id: Optional[int] = None
     description: Optional[str] = None
     page_number: Optional[int] = None
+    original_page_number: Optional[int] = None
     file_path: str
     original_filename: Optional[str] = None
     ocr_text: Optional[str] = None
@@ -234,6 +241,9 @@ class HospitalRecordBase(BaseModel):
     admission_date: Optional[str] = None
     discharge_date: Optional[str] = None
     hospital_days: Optional[int] = None
+    review_status: Optional[str] = "pending"
+    extraction_confidence: Optional[int] = None
+    quality_flags: Optional[str] = None
 
 
 class HospitalRecordCreate(HospitalRecordBase):
@@ -248,7 +258,71 @@ class HospitalRecordUpdate(HospitalRecordBase):
 class HospitalRecordResponse(HospitalRecordBase):
     id: int
     case_id: int
+    group_id: Optional[int] = None
     material_id: Optional[int] = None
+    source_material_id: Optional[int] = None
+    source_material_filename: Optional[str] = None
+    source_material_description: Optional[str] = None
+    source_material_page_number: Optional[int] = None
+    source_material_file_path: Optional[str] = None
+    source_material_image_url: Optional[str] = None
+    source_material_count: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ==================== MedicalEvent ====================
+
+class MedicalEventBase(BaseModel):
+    hospital_name: Optional[str] = None
+    event_type: str
+    event_date: Optional[str] = None
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    diagnosis: Optional[str] = None
+    findings: Optional[str] = None
+    treatment: Optional[str] = None
+    source_quote: Optional[str] = None
+    material_subtype: Optional[str] = None
+    source_material_ids: Optional[str] = None
+    source_page_numbers: Optional[str] = None
+    review_status: Optional[str] = "pending"
+    extraction_confidence: Optional[int] = None
+    quality_flags: Optional[str] = None
+
+
+class MedicalEventCreate(MedicalEventBase):
+    case_id: int
+    group_id: Optional[int] = None
+    hospital_record_id: Optional[int] = None
+
+
+class MedicalEventUpdate(BaseModel):
+    hospital_name: Optional[str] = None
+    event_type: Optional[str] = None
+    event_date: Optional[str] = None
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    diagnosis: Optional[str] = None
+    findings: Optional[str] = None
+    treatment: Optional[str] = None
+    source_quote: Optional[str] = None
+    material_subtype: Optional[str] = None
+    source_material_ids: Optional[str] = None
+    source_page_numbers: Optional[str] = None
+    review_status: Optional[str] = None
+    extraction_confidence: Optional[int] = None
+    quality_flags: Optional[str] = None
+
+
+class MedicalEventResponse(MedicalEventBase):
+    id: int
+    case_id: int
+    group_id: Optional[int] = None
+    hospital_record_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -264,21 +338,40 @@ class ImagingReportBase(BaseModel):
     film_number: Optional[str] = None
     film_count: Optional[int] = 1
     report_content: Optional[str] = None
+    review_status: Optional[str] = "pending"
+    extraction_confidence: Optional[int] = None
+    quality_flags: Optional[str] = None
 
 
 class ImagingReportCreate(ImagingReportBase):
     case_id: int
+    group_id: Optional[int] = None
     material_id: Optional[int] = None
+    source_material_ids: Optional[str] = None
+    source_page_numbers: Optional[str] = None
 
 
 class ImagingReportUpdate(ImagingReportBase):
-    pass
+    group_id: Optional[int] = None
+    material_id: Optional[int] = None
+    source_material_ids: Optional[str] = None
+    source_page_numbers: Optional[str] = None
 
 
 class ImagingReportResponse(ImagingReportBase):
     id: int
     case_id: int
+    group_id: Optional[int] = None
     material_id: Optional[int] = None
+    source_material_ids: Optional[str] = None
+    source_page_numbers: Optional[str] = None
+    source_material_id: Optional[int] = None
+    source_material_filename: Optional[str] = None
+    source_material_description: Optional[str] = None
+    source_material_page_number: Optional[int] = None
+    source_material_file_path: Optional[str] = None
+    source_material_image_url: Optional[str] = None
+    source_material_count: Optional[int] = None
 
     class Config:
         from_attributes = True
