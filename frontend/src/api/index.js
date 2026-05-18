@@ -179,6 +179,7 @@ export default {
   generateMaterialSummary: (caseId) => api.post(`/llm/cases/${caseId}/generate-material-summary`, null, { timeout: 10 * 60 * 1000 }),
   generateAppraisalProcess: (caseId) => api.post(`/llm/cases/${caseId}/generate-appraisal-process`),
   extractImagingReports: (caseId) => api.post(`/llm/cases/${caseId}/extract-imaging-reports`),
+  getAnalysisHarness: (caseId) => api.get(`/llm/cases/${caseId}/analysis-harness`),
   generateAnalysis: (caseId) => api.post(`/llm/cases/${caseId}/generate-analysis`),
   generateOpinion: (caseId) => api.post(`/llm/cases/${caseId}/generate-opinion`),
   generateFullReport: (caseId) => api.post(`/llm/cases/${caseId}/generate-full-report`, null, { timeout: 10 * 60 * 1000 }),

@@ -12,11 +12,25 @@ from typing import Optional
 from app.database import get_db
 from app.models.case import (
     Case, CaseStatus, Material, MaterialGroup, MaterialType, OcrStatus,
-    Person, HospitalRecord, ImagingReport, Report,
+    Person, HospitalRecord, ImagingReport, MedicalEvent, Report,
+    StandardChunk, StandardDocument,
 )
 from app.utils.llm import (
     extract_fields, extract_case_summary, call_llm, extract_medical_group_fields,
     call_llm_json_harness, call_llm_text_harness,
+)
+from app.utils.standards import (
+    _parse_entrustment_items,
+    _map_entrustment_to_standard_ids,
+    build_standard_toc,
+    search_clauses_in_documents,
+    format_selected_clauses,
+    chunk_to_reference,
+)
+from app.utils.analysis_harness import (
+    build_analysis_harness_payload,
+    format_analysis_harness_for_prompt,
+    validate_analysis_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -912,7 +926,24 @@ def generate_analysis_api(case_id: int, db: Session = Depends(get_db)):
         "message": msg,
         "analysis": result["analysis"],
         "method": result.get("method", "unknown"),
+        "standard_references": result.get("standard_references", []),
+        "analysis_warnings": result.get("warnings", []),
     }
+
+
+@router.get("/cases/{case_id}/analysis-harness")
+def get_analysis_harness_api(case_id: int, db: Session = Depends(get_db)):
+    """
+    生成分析说明前的护栏材料：
+    - 案件基础事实
+    - 底层病历/检查证据
+    - 伤残及三期候选清单
+    - 精准规范条款映射
+    """
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    return build_analysis_harness_payload(case_id, db)
 
 
 @router.post("/cases/{case_id}/generate-opinion")
@@ -1605,10 +1636,237 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
     return {"success": True, "appraisal_process": process_text, "method": "llm"}
 
 
-def _generate_analysis(case_id: int, db) -> dict:
-    """使用 LLM 生成分析说明，失败时回退到拼接（fallback）"""
-    from app.utils.llm import call_llm
+def _select_analysis_standards(case_id: int, db, entrustment: str, diagnoses_text: str) -> list[dict]:
+    """三层检索：规则映射 → LLM 选条款 → 精准检索，为分析说明找到对口的标准条款"""
+    items = _parse_entrustment_items(entrustment)
+    item_to_docs = _map_entrustment_to_standard_ids(items, db)
+    all_doc_ids = set().union(*item_to_docs.values())
+    if not all_doc_ids:
+        return []
 
+    # 构建标准目录供 LLM 导航
+    toc_docs = build_standard_toc(db, all_doc_ids)
+    toc_compact = []
+    for doc in toc_docs:
+        sections_compact = [f"{s['code']} {s['title']}".strip() for s in doc["sections"] if (s["code"] or s["title"])]
+        toc_compact.append({"standard_name": doc["standard_name"], "sections": sections_compact[:60]})
+    toc_text = "\n".join(f"【{d['standard_name']}】\n" + "\n".join(f"  · {s}" for s in d["sections"]) for d in toc_compact)
+
+    prompt = f"""你是法医临床学鉴定人。根据案件信息和委托事项，从标准目录中选出应引用的条款。
+
+委托事项：{entrustment}
+关键诊断（出院诊断/手术证实）：{diagnoses_text[:600]}
+
+标准目录：
+{toc_text}
+
+返回JSON，每个委托事项选出最相关的条款标题和检索关键词。条款标题必须从目录中选择，不可编造。"""
+
+    result = call_llm_json_harness(
+        task_name="select_analysis_standards",
+        system_prompt="你是法医临床学鉴定人。只输出JSON。",
+        instructions=prompt,
+        input_text=toc_text,
+        output_schema='{"selections": [{"entrustment_item": "伤残等级", "relevant_sections": ["条款标题"], "keywords": "检索词"}]}',
+        required_fields=["selections"],
+        temperature=0.0,
+        max_tokens=2000,
+        max_input_chars=8000,
+        max_retries=1,
+    )
+
+    selections = result.get("data", {}).get("selections", []) if result.get("success") else []
+    all_keywords = " ".join(s.get("keywords", "") for s in selections)
+    section_codes = set()
+    for s in selections:
+        for section in s.get("relevant_sections", []):
+            m = re.match(r"^([\d.]+)", str(section))
+            if m:
+                section_codes.add(m.group(1))
+
+    if all_keywords and all_doc_ids:
+        refs = search_clauses_in_documents(db, all_doc_ids, all_keywords)
+        if section_codes:
+            extra = db.query(StandardChunk).filter(
+                StandardChunk.document_id.in_(list(all_doc_ids)),
+                StandardChunk.section_code.in_(list(section_codes)),
+            ).all()
+            extra_ids = {r["id"] for r in refs}
+            for chunk in extra:
+                if chunk.id not in extra_ids:
+                    refs.append(chunk_to_reference(chunk, 10.0))
+            refs.sort(key=lambda r: r.get("score", 0), reverse=True)
+        return refs
+    return []
+
+
+def _analysis_entrustment_flags(entrustment: str) -> dict[str, bool]:
+    text = entrustment or ""
+    return {
+        "disability": any(term in text for term in ("伤残", "残疾", "致残", "伤残等级")),
+        "work_loss": "误工" in text,
+        "nursing": "护理" in text and "护理依赖" not in text,
+        "nutrition": "营养" in text,
+        "nursing_dependency": "护理依赖" in text,
+        "followup_cost": any(term in text for term in ("后续治疗", "后期治疗", "医疗费", "治疗费")),
+        "causation": any(term in text for term in ("因果", "参与度", "关系")),
+    }
+
+
+def _reference_identity(ref: dict) -> tuple:
+    text = re.sub(r"\s+", "", ref.get("text") or ref.get("snippet") or "")
+    return (
+        ref.get("id"),
+        ref.get("standard_name") or "",
+        ref.get("section_code") or "",
+        ref.get("section_title") or "",
+        text[:80],
+    )
+
+
+def _classify_analysis_references(refs: list[dict], entrustment: str, context: str) -> list[dict]:
+    """把规范检索结果分为拟引用、辅助判断和低置信候选，避免把候选依据当成正式依据。"""
+    flags = _analysis_entrustment_flags(entrustment)
+    context_text = f"{entrustment}\n{context}"
+    seen = set()
+    grouped: dict[str, list[dict]] = {"primary": [], "supporting": [], "candidate": []}
+
+    for ref in refs:
+        ident = _reference_identity(ref)
+        if ident in seen:
+            continue
+        seen.add(ident)
+
+        doc = ref.get("standard_name") or ""
+        section = " ".join(filter(None, [ref.get("section_code"), ref.get("section_title")]))
+        text = f"{doc}\n{section}\n{ref.get('text') or ref.get('snippet') or ''}"
+        role = "candidate"
+        reason = "关键词命中，需人工判断是否采信"
+
+        if "人体损伤致残程度分级" in doc and flags["disability"]:
+            role = "primary"
+            reason = "委托事项包含伤残等级，可作为伤残结论拟引用依据"
+        elif "误工期" in doc and any(flags[k] for k in ("work_loss", "nursing", "nutrition")):
+            role = "primary"
+            reason = "委托事项包含误工期、护理期或营养期，可作为三期结论拟引用依据"
+        elif "护理依赖" in doc and flags["nursing_dependency"]:
+            role = "primary"
+            reason = "委托事项包含护理依赖，可作为护理依赖结论拟引用依据"
+        elif "因果关系" in doc and flags["causation"]:
+            role = "primary"
+            reason = "委托事项包含因果关系，可作为因果关系分析拟引用依据"
+        elif any(name in doc for name in ("法医影像学", "影像学检验", "法医临床检验")):
+            role = "supporting"
+            reason = "用于影像复核或检验过程判断，不直接作为伤残/三期结论条款"
+        elif any(name in doc for name in ("听觉功能障碍", "视觉功能障碍")):
+            if any(term in context_text for term in ("听觉", "听力", "耳", "视觉", "视力", "眼")):
+                role = "supporting"
+                reason = "与专科功能障碍相关，可作辅助判断"
+            else:
+                reason = "专科功能障碍候选，与当前委托事项关联较弱"
+
+        annotated = dict(ref)
+        annotated["reference_role"] = role
+        annotated["reference_role_label"] = {
+            "primary": "拟引用依据",
+            "supporting": "辅助判断依据",
+            "candidate": "低置信候选依据",
+        }[role]
+        annotated["match_reason"] = reason
+        annotated["display_section"] = section
+        grouped[role].append(annotated)
+
+    limits = {"primary": 10, "supporting": 5, "candidate": 4}
+    ordered: list[dict] = []
+    for role in ("primary", "supporting", "candidate"):
+        rows = sorted(grouped[role], key=lambda r: r.get("score", 0), reverse=True)
+        ordered.extend(rows[:limits[role]])
+    return ordered
+
+
+def _format_analysis_reference_context(refs: list[dict]) -> str:
+    primary = [r for r in refs if r.get("reference_role") == "primary"]
+    supporting = [r for r in refs if r.get("reference_role") == "supporting"]
+    candidate = [r for r in refs if r.get("reference_role") == "candidate"]
+
+    parts = [
+        "【拟引用规范依据】（正式结论只能引用本栏条款，不得引用未列出的条款号）",
+        format_selected_clauses(primary, max_chars=4200) if primary else "未检索到拟引用条款，正式结论应采用审慎表述。",
+    ]
+    if supporting:
+        parts.extend([
+            "\n【辅助判断依据】（只用于影像复核、事实判断，不得直接写成伤残等级或三期条款依据）",
+            format_selected_clauses(supporting, max_chars=1600),
+        ])
+    if candidate:
+        parts.extend([
+            "\n【低置信候选依据】（仅提示人工核对，正文不得直接引用）",
+            format_selected_clauses(candidate, max_chars=900),
+        ])
+    return "\n".join(parts)
+
+
+def _merge_analysis_references(*groups: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for ref in group or []:
+            key = str(ref.get("clause_key") or ref.get("id") or ref.get("clause_label") or ref.get("snippet"))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(ref)
+    return merged
+
+
+def _clean_generated_report_text(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.S | re.I).strip()
+    if re.search(r"<think\b", text, flags=re.I):
+        final_match = re.search(r"(根据委托单位提供的现有材料|1\.\s*被鉴定人)", text)
+        text = text[final_match.start():].strip() if final_match else ""
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    text = re.sub(r"(?m)^\s*[-*]\s+", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _remove_uncommissioned_analysis(text: str, entrustment: str) -> tuple[str, list[str]]:
+    flags = _analysis_entrustment_flags(entrustment)
+    warnings: list[str] = []
+    if flags["followup_cost"]:
+        return text, warnings
+
+    followup_terms = ("后续治疗费", "后续治疗费用", "后期医疗费用", "后期治疗费", "医疗费用", "后续治疗项目")
+    if not any(term in text for term in followup_terms):
+        return text, warnings
+
+    blocks = re.split(r"(?m)(?=^\s*\d+\.\s*)", text)
+    kept = []
+    removed = 0
+    for block in blocks:
+        stripped = block.strip()
+        if not stripped:
+            continue
+        number_match = re.match(r"^(\d+)\.", stripped)
+        if number_match and int(number_match.group(1)) >= 3 and any(term in stripped for term in followup_terms):
+            removed += 1
+            continue
+        kept.append(block.strip())
+    cleaned = "\n\n".join(kept).strip() if kept else text
+    if removed:
+        warnings.append("已移除未在委托事项中的后续治疗费/后期医疗费用段落。")
+    return cleaned, warnings
+
+
+def _generate_analysis(case_id: int, db) -> dict:
+    """使用 LLM 生成分析说明：三层智能检索 + 真实鉴定意见书格式"""
     case = db.query(Case).filter(Case.id == case_id).first()
     records = db.query(HospitalRecord).filter(HospitalRecord.case_id == case_id).all()
     img_reports = db.query(ImagingReport).filter(ImagingReport.case_id == case_id).all()
@@ -1620,44 +1878,81 @@ def _generate_analysis(case_id: int, db) -> dict:
     person_name = person.name if person and person.name else "被鉴定人"
     entrustment = case.entrustment_matter or ""
 
-    # 构建住院记录数据
     hospital_data = []
     for r in records:
-        item = {
-            "医院名称": r.hospital_name or "",
-            "住院号": r.admission_number or "",
-            "入院日期": r.admission_date or "",
-            "出院日期": r.discharge_date or "",
-            "住院天数": r.hospital_days or "",
-            "入院诊断": r.admission_diagnosis or "",
-            "出院诊断": r.discharge_diagnosis or "",
-            "治疗经过": r.treatment_process or "",
+        hospital_data.append({
+            "医院名称": r.hospital_name or "", "住院号": r.admission_number or "",
+            "入院日期": r.admission_date or "", "出院日期": r.discharge_date or "",
+            "住院天数": r.hospital_days or "", "入院诊断": r.admission_diagnosis or "",
+            "出院诊断": r.discharge_diagnosis or "", "治疗经过": r.treatment_process or "",
             "出院医嘱": r.discharge_orders or "",
-        }
-        hospital_data.append(item)
+        })
 
-    # 构建影像学报告数据
     imaging_data = []
     for r in img_reports:
-        item = {
-            "报告日期": r.report_date or "",
-            "医院名称": r.hospital_name or "",
-            "检查类型": r.exam_type or "",
-            "检查部位": r.exam_part or "",
-            "片子编号": r.film_number or "",
-            "报告内容": r.report_content or "",
-        }
-        imaging_data.append(item)
+        imaging_data.append({
+            "报告日期": r.report_date or "", "医院名称": r.hospital_name or "",
+            "检查类型": r.exam_type or "", "检查部位": r.exam_part or "",
+            "片子编号": r.film_number or "", "报告内容": r.report_content or "",
+        })
 
-    # ===== 尝试 LLM 生成 =====
-    system_prompt = """你是一位资深法医临床学鉴定人，擅长撰写司法鉴定意见书中的"分析说明"部分。
-请严格按照司法鉴定意见书的规范格式生成文本。"""
+    # 分析说明护栏：先形成案件事实、伤残候选和精准条款，再交给 LLM 写正文
+    harness_payload = build_analysis_harness_payload(case_id, db)
+    harness_context = format_analysis_harness_for_prompt(harness_payload)
 
-    user_prompt = f"""请根据以下案件信息，撰写司法鉴定意见书的"分析说明"部分。
+    # 三层智能检索（作为补充，不再直接支配伤残候选）
+    diagnoses_parts = [f"【{r.hospital_name or ''}出院诊断】{r.discharge_diagnosis}" for r in records if r.discharge_diagnosis]
+    for r in records:
+        if r.treatment_process and any(kw in (r.treatment_process or "") for kw in ("手术", "探查", "修补", "置换", "内固定")):
+            diagnoses_parts.append(f"【{r.hospital_name or ''}手术经过】{(r.treatment_process or '')[:300]}")
+    diagnoses_text = "\n".join(diagnoses_parts)
 
-【权威信息】（已由鉴定人确认，必须以此为准）
-被鉴定人：{person_name}
-委托鉴定事项：{entrustment}
+    raw_standard_refs = _select_analysis_standards(case_id, db, entrustment, diagnoses_text)
+    supplemental_refs = _classify_analysis_references(raw_standard_refs, entrustment, diagnoses_text)
+    standard_refs = _merge_analysis_references(harness_payload.get("standard_references", []), supplemental_refs)
+    standard_context = _format_analysis_reference_context(standard_refs) if standard_refs else "未检索到可用规范依据。"
+    entrusted_items = "、".join(_parse_entrustment_items(entrustment)) or "未明确"
+
+    # LLM 生成
+    system_prompt = """你是法医临床学鉴定人。请参照真实司法鉴定意见书"分析说明"的写法，撰写分析说明。
+
+以下是一个真实案例的分析说明写法，请参照其结构和语言风格：
+
+案件A——颅脑损伤：
+1. 被鉴定人杨豫臻外伤史明确，系交通事故所致。
+2. 被鉴定人杨豫臻外伤致闭合性颅脑损伤（多发脑挫裂伤、头皮血肿、头皮裂伤）等诊断明确（经CT、临床检查和手术等证实）。
+3. 被鉴定人杨豫臻颅脑损伤较重...现其伤后9个月余，自诉烦躁、头晕...有鉴于此，参照《人体损伤致残程度分级》第5.9.1条3）项（脑叶部分切除术后）之规定，被鉴定人杨豫臻颅脑损伤致脑叶部分切除术后应评为九级伤残。
+4. 被鉴定人杨豫臻，女，32岁。2021年1月7日外伤致闭合性颅脑损伤...有鉴于此，参照中华人民共和国公共安全行业标准（GA/T 1193-2014）《人身损害误工期、护理期、营养期评定规范》...结合其年龄、自身情况、损伤情况、临床治疗、伤情恢复实际状况，其误工期拟定至伤残评定前一日；其住院期间护理人数建议为2人；其出院后护理期拟定为90日、护理人数拟定为1人。
+
+案件B——多发骨折：
+1. 被鉴定人张金遂外伤史确切，系道路交通事故所致。
+2. 被鉴定人张金遂外伤致左锁骨中段粉碎性骨折、右肩胛骨骨折、右侧额叶脑挫裂伤等诊断明确（经X线、CT、临床检查及手术证实）。
+3. 被鉴定人张金遂左锁骨中段粉碎性骨折、右肩胛骨骨折，经临床积极行"左锁骨骨折切开复位内固定术"及对症治疗，伤情稳定恢复。其右侧额叶脑挫裂伤经临床对症治疗，伤情稳定。复阅其2021年8月25日头颅MRI片提示右侧额叶软化灶，周围多发含铁血黄素沉积。有鉴于此，参照《人体损伤致残程度分级》第5.10.1条2）项（颅脑损伤后遗脑软化灶形成，伴有神经系统症状或者体征）之规定，被鉴定人张金遂右侧额叶脑挫裂伤后遗脑软化灶形成应评为十级伤残。
+4. 被鉴定人张金遂，男，现年54岁，2021年4月16日外伤致左锁骨中段粉碎性骨折等，经临床积极行"左锁骨骨折切开复位内固定术"及对症治疗，于2021年6月15日伤情稳定出院。因此，根据其损伤情况，结合其年龄、自身情况、临床治疗经过、目前恢复情况，参照中华人民共和国公共安全行业标准(GA/T 1193-2014)《人身损害误工期、护理期、营养期评定规范》有关规定，其出院后的误工期拟定为60日。
+5. 被鉴定人张金遂目前左锁骨骨折处内固定物在位，日后还需二次手术取出上述内固定物。手术费用构成一般包括入院检查检验费、麻醉费、手术费、住院费、相关预防感染药物及输液、消肿、止血等药物费。参考河南省地市级三级医院收费情况，后续治疗费用约需人民币捌仟圆（¥8000.0元）。
+
+要求：
+- 开头固定："根据委托单位提供的现有材料，结合本鉴定中心检验所见，现分析如下："
+- 第1条确认外伤来源，第2条确认所有伤情诊断
+- 第3条起只逐一分析【委托鉴定事项】列明的项目，不得增加未委托事项
+- 必须先遵守【分析说明护栏】；案件基础事实以护栏为准，不得套用示例中的姓名、性别、年龄
+- 伤残等级只能对护栏中 decision=met 的候选写正式结论；decision=uncertain 的候选只能写为需核对或辅助事实，不得直接定级
+- 必须覆盖所有 decision=met 的候选；不得把未在护栏中满足的候选写成正式伤残结论
+- 条款号和条款内容必须优先使用护栏给出的规范；不得把髋关节置换误写成其他不相干条款
+- 引用条款时，只能引用【拟引用规范依据】中的具体条款号和条款内容；【辅助判断依据】只能用于事实判断，不得写成结论依据
+- 如果拟引用依据不足以支撑某个具体条款号，应写"参照相关规定并结合临床资料综合评定"，不要编造条款号
+- 三期分析固定句式："因此，根据其损伤情况，结合其年龄、自身情况、临床治疗经过、目前恢复情况，参照...有关规定，其...拟定为X日"
+- 三期天数必须落在护栏或规范依据列出的范围内；多发损伤只能综合考虑，不能简单相加
+- 只有委托事项包含后续治疗费/治疗费时才分析费用，金额需同时写大写和小写
+- 不要输出ICD编码、Markdown项目符号、思考过程或解释说明
+- 只输出分析说明正文，不要标题"""
+
+    user_prompt = f"""【被鉴定人】{person_name}
+【委托鉴定事项】{entrustment}
+【本次只允许分析的委托项目】{entrusted_items}
+
+【分析说明护栏】
+{harness_context}
 
 住院记录数据（共{len(records)}份）：
 {json.dumps(hospital_data, ensure_ascii=False, indent=2)}
@@ -1665,93 +1960,51 @@ def _generate_analysis(case_id: int, db) -> dict:
 影像学报告数据（共{len(img_reports)}份）：
 {json.dumps(imaging_data, ensure_ascii=False, indent=2)}
 
-要求：
-分析说明必须遵循以下三段逻辑结构：
+【规范依据】
+{standard_context}"""
 
-第一段：确认外伤来源
-- 以"根据委托单位提供的现有材料，结合本鉴定中心检验所见，现分析如下："开头
-- 第1条：确认被鉴定人外伤史确切，系何种事故所致（从事故认定书等材料中提取事故类型）
-
-第二段：确认所有伤情
-- 第2条：列出被鉴定人的全部诊断/伤情
-- 综合入院诊断、出院诊断、影像学检查结果
-- 注明诊断"明确"，并标注经何种检查证实（如"经X线、CT、临床检查及手术证实"）
-
-第三段：按委托鉴定事项逐一分析
-- 第3条起，每条对应上方"委托鉴定事项"中的一个事项
-- 必须严格按照委托鉴定事项的内容和顺序逐一分析，不得自行增减鉴定事项
-- 伤残等级分析：需引用具体鉴定标准条款（如《人体损伤致残程度分级》），写明"参照第X条X项规定，应评为X级伤残"
-- 误工期分析：引用《人身损害误工期、护理期、营养期评定规范》(GA/T1193-2014)，结合年龄、治疗经过、恢复情况给出具体天数
-- 后续治疗费分析：如内固定物在位，需说明二次手术取出的费用估算，参考河南省地市级三级医院收费情况
-
-格式要求：
-1. 每条以阿拉伯数字编号（1. 2. 3. 等）
-2. 语言规范严谨，符合司法鉴定文书格式
-3. 诊断名称必须使用病历中的原始表述，不要改写
-4. 影像学检查发现需融入伤情分析中（如"复阅其2021年8月25日头颅MRI片提示..."）
-5. 只输出分析说明正文，不要加标题、不要加说明性文字"""
-
-    llm_result = call_llm(
+    llm_result = call_llm_text_harness(
+        task_name="generate_analysis",
         system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=0.3,
-        max_tokens=3000,
+        instructions=user_prompt,
+        temperature=0.0,
+        max_tokens=5000,
+        max_input_chars=12000,
+        max_retries=1,
     )
 
     if llm_result.get("success"):
-        analysis_text = llm_result["content"].strip()
-        # 去除 markdown 代码块标记
-        if analysis_text.startswith("```"):
-            lines = analysis_text.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            analysis_text = "\n".join(lines).strip()
-        logger.info(f"案件 {case_id} 分析说明 LLM 生成成功")
-        return {"success": True, "analysis": analysis_text, "method": "llm"}
+        analysis_text = _clean_generated_report_text(llm_result["content"])
+        analysis_text, warnings = _remove_uncommissioned_analysis(analysis_text, entrustment)
+        warnings.extend(validate_analysis_text(analysis_text, harness_payload))
+        warnings.extend(harness_payload.get("warnings", []))
+        warnings = list(dict.fromkeys(warnings))
+        logger.info(f"案件 {case_id} 分析说明 LLM 生成成功（检索到 {len(standard_refs)} 条标准条款）")
+        return {
+            "success": True,
+            "analysis": analysis_text,
+            "method": "llm",
+            "standard_references": standard_refs,
+            "warnings": warnings,
+        }
 
-    # ===== Fallback：LLM 失败，回退到拼接 =====
-    logger.warning(f"案件 {case_id} 分析说明 LLM 生成失败（{llm_result.get('error')}），回退到拼接模式")
-    analysis_parts = []
-
-    if person_name:
-        analysis_parts.append(f"被鉴定人{person_name}，")
-
-    if entrustment:
-        analysis_parts.append(f"因{entrustment}，")
-
-    if records:
-        analysis_parts.append("伤后到医院就诊治疗。")
-        analysis_parts.append("")
-        analysis_parts.append("根据送鉴病历资料记载：")
-
-        for r in records:
-            hospital = r.hospital_name or "某医院"
-            if r.admission_diagnosis:
-                analysis_parts.append(f"1. {hospital}入院诊断：{r.admission_diagnosis}。")
-            if r.discharge_diagnosis:
-                analysis_parts.append(f"   出院诊断：{r.discharge_diagnosis}。")
-            if r.treatment_process:
-                analysis_parts.append(f"   治疗过程：{r.treatment_process}。")
-
-    if img_reports:
-        analysis_parts.append("")
-        analysis_parts.append("根据送鉴影像学资料复阅：")
-        for r in img_reports:
-            hospital = r.hospital_name or "某医院"
-            exam_type = r.exam_type or "影像学检查"
-            content = r.report_content or ""
-            analysis_parts.append(f"{hospital}{exam_type}示：{content}。")
-
-    if records:
-        discharge_diag = records[0].discharge_diagnosis if records else ""
-        if discharge_diag:
-            analysis_parts.append("")
-            analysis_parts.append(f"综合分析认为，被鉴定人的诊断明确，与外伤之间存在直接因果关系。")
-
-    analysis_text = "\n".join(analysis_parts)
-    return {"success": True, "analysis": analysis_text, "method": "fallback"}
+    # Fallback
+    logger.warning(f"案件 {case_id} 分析说明 LLM 生成失败（{llm_result.get('error')}），回退到拼接")
+    parts = [f"根据委托单位提供的现有材料，结合本鉴定中心检验所见，现分析如下：", ""]
+    parts.append(f"1. 被鉴定人{person_name}外伤史确切，系事故所致。")
+    diag_list = "；".join(r.discharge_diagnosis or "" for r in records)
+    parts.append(f"2. 被鉴定人{person_name}外伤致{diag_list}诊断明确。")
+    parts.append(f"3. 综合分析认为，被鉴定人{person_name}的损伤与本次外伤之间存在直接因果关系。")
+    fallback_text, warnings = _remove_uncommissioned_analysis("\n".join(parts), entrustment)
+    warnings.extend(harness_payload.get("warnings", []))
+    warnings = list(dict.fromkeys(warnings))
+    return {
+        "success": True,
+        "analysis": fallback_text,
+        "method": "fallback",
+        "standard_references": standard_refs,
+        "warnings": warnings,
+    }
 
 
 def _generate_opinion(case_id: int, db) -> dict:
@@ -1810,9 +2063,10 @@ def _generate_opinion(case_id: int, db) -> dict:
     if not result.get("success"):
         return {"success": False, "error": result.get("error", "生成失败")}
 
+    opinion_text = _clean_generated_report_text(result["content"])
     return {
         "success": True,
-        "opinion": result["content"],
+        "opinion": opinion_text,
         "model": result.get("model", ""),
     }
 

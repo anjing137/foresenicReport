@@ -5,6 +5,8 @@
 
 # ===== 数据库（用户数据）=====
 *.db
+*.db-wal
+*.db-shm
 *.db.bak
 *.db.bak_*
 

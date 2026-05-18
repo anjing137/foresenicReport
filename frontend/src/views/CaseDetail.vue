@@ -1035,18 +1035,15 @@
                 <el-button type="primary" size="small" @click="handleGenerateAnalysis" :loading="extractingAnalysis">
                   <el-icon><MagicStick /></el-icon> 智能生成
                 </el-button>
-                <el-button size="small" plain @click="handleImportStandards" :loading="importingStandards">
-                  <el-icon><Files /></el-icon> 导入规范库
-                </el-button>
-                <el-button size="small" plain @click="handleStartStandardOcr" :loading="standardOcrRunning">
-                  <el-icon><MagicStick /></el-icon> OCR扫描版规范
-                </el-button>
                 <el-button size="small" plain @click="openStandardReviewDialog" :loading="loadingStandardReview">
                   <el-icon><Edit /></el-icon> 规范核验
                   <span v-if="standardReviewCount !== null">({{ standardReviewCount }})</span>
                 </el-button>
                 <el-button size="small" plain @click="loadCaseStandardReferences" :loading="loadingStandardRefs">
                   <el-icon><Search /></el-icon> 刷新依据
+                </el-button>
+                <el-button size="small" plain @click="loadAnalysisHarness(false)" :loading="loadingAnalysisHarness">
+                  <el-icon><Search /></el-icon> 伤残候选
                 </el-button>
                 <span style="color: #999; font-size: 12px; margin-left: 8px;">基于住院记录和检查报告自动生成分析说明</span>
               </div>
@@ -1062,18 +1059,57 @@
                   <span v-if="standardOcrStatus.task.current_title">；当前：{{ standardOcrStatus.task.current_title }}</span>
                 </template>
               </el-alert>
+              <div v-if="analysisHarnessCandidates.length" class="analysis-harness-box">
+                <div class="analysis-harness-title">生成前伤残候选核验</div>
+                <el-alert
+                  v-if="analysisHarnessWarnings.length"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  style="margin-bottom: 8px;"
+                >
+                  <template #title>{{ analysisHarnessWarnings.join('；') }}</template>
+                </el-alert>
+                <div
+                  v-for="candidate in analysisHarnessCandidates"
+                  :key="candidate.id"
+                  class="analysis-candidate-row"
+                >
+                  <div class="analysis-candidate-head">
+                    <el-tag size="small" :type="analysisCandidateTag(candidate.decision)">
+                      {{ candidate.decision === 'met' ? '可采信' : candidate.decision === 'uncertain' ? '需核对' : candidate.decision }}
+                    </el-tag>
+                    <strong>{{ candidate.title }}</strong>
+                    <span class="analysis-candidate-suggestion">{{ candidate.suggestion || candidate.grade }}</span>
+                  </div>
+                  <div class="analysis-candidate-meta">理由：{{ candidate.reason }}</div>
+                  <div class="analysis-candidate-meta">来源：{{ analysisCandidateEvidence(candidate) }}</div>
+                  <div v-if="analysisCandidateStandards(candidate)" class="analysis-candidate-meta">规范：{{ analysisCandidateStandards(candidate) }}</div>
+                </div>
+              </div>
               <div v-if="standardReferences.length" class="standard-reference-box">
-                <div class="standard-reference-title">本案匹配到的规范依据</div>
-                <el-collapse>
-                  <el-collapse-item
-                    v-for="(ref, idx) in standardReferences"
-                    :key="ref.id || idx"
-                    :title="standardReferenceTitle(ref, idx)"
-                    :name="idx"
-                  >
-                    <div class="standard-reference-text">{{ ref.snippet || ref.text }}</div>
-                  </el-collapse-item>
-                </el-collapse>
+                <div class="standard-reference-title">规范依据匹配结果</div>
+                <div
+                  v-for="group in standardReferenceGroups"
+                  :key="group.role"
+                  class="standard-reference-group"
+                >
+                  <div class="standard-reference-group-head">
+                    <el-tag size="small" :type="group.tagType">{{ group.label }}</el-tag>
+                    <span>{{ group.description }}</span>
+                  </div>
+                  <el-collapse>
+                    <el-collapse-item
+                      v-for="(ref, idx) in group.items"
+                      :key="`${group.role}-${ref.id || idx}`"
+                      :title="standardReferenceTitle(ref, idx)"
+                      :name="`${group.role}-${idx}`"
+                    >
+                      <div v-if="ref.match_reason" class="standard-reference-reason">匹配理由：{{ ref.match_reason }}</div>
+                      <div class="standard-reference-text">{{ ref.snippet || ref.text }}</div>
+                    </el-collapse-item>
+                  </el-collapse>
+                </div>
               </div>
               <el-form label-width="100px" :disabled="isCompleted">
                 <el-form-item label="分析说明">
@@ -1904,7 +1940,44 @@ const extractingOpinion = ref(false)
 const generatingWord = ref(false)
 const importingStandards = ref(false)
 const loadingStandardRefs = ref(false)
+const loadingAnalysisHarness = ref(false)
 const standardReferences = ref([])
+const analysisHarness = ref(null)
+const analysisHarnessCandidates = computed(() => analysisHarness.value?.candidates || [])
+const analysisHarnessWarnings = computed(() => analysisHarness.value?.warnings || [])
+const analysisCandidateTag = (decision) => {
+  if (decision === 'met') return 'success'
+  if (decision === 'uncertain') return 'warning'
+  return 'info'
+}
+const standardReferenceGroups = computed(() => {
+  const groups = [
+    {
+      role: 'primary',
+      label: '拟引用依据',
+      description: '可进入分析说明正文的正式依据',
+      tagType: 'success',
+    },
+    {
+      role: 'supporting',
+      label: '辅助判断依据',
+      description: '用于影像复核或事实判断，不直接作为结论条款',
+      tagType: 'warning',
+    },
+    {
+      role: 'candidate',
+      label: '低置信候选',
+      description: '仅提示人工核对',
+      tagType: 'info',
+    },
+  ]
+  return groups
+    .map(group => ({
+      ...group,
+      items: (standardReferences.value || []).filter(ref => (ref.reference_role || 'candidate') === group.role),
+    }))
+    .filter(group => group.items.length)
+})
 const standardOcrRunning = ref(false)
 const standardOcrStatus = ref(null)
 const standardOcrPollTimer = ref(null)
@@ -3065,6 +3138,7 @@ async function loadCase() {
     // 加载 PDF 转换页面
     await loadPdfPages()
     await loadCaseStandardReferences(true)
+    await loadAnalysisHarness(true)
   } catch (e) {
     ElMessage.error('加载案件失败')
   }
@@ -3542,7 +3616,28 @@ async function handleExtractImagingReports() {
 
 function standardReferenceTitle(ref, idx) {
   const section = [ref.section_code, ref.section_title].filter(Boolean).join(' ')
-  return `${idx + 1}. 《${ref.standard_name}》${section ? ` ${section}` : ''}`
+  const score = typeof ref.score === 'number' ? `（${ref.score}）` : ''
+  return `${idx + 1}. 《${ref.standard_name}》${section ? ` ${section}` : ''}${score}`
+}
+
+function analysisCandidateEvidence(candidate) {
+  const rows = (candidate.evidence || []).slice(0, 4)
+  if (!rows.length) return '暂无来源'
+  return rows.map(item => {
+    const pages = (item.source_pages || []).length ? `页码${item.source_pages.join(',')}` : '页码未明'
+    const title = item.title || item.kind || '来源'
+    const quote = item.quote || item.summary || ''
+    return `${title}（${pages}）：${quote.slice(0, 60)}`
+  }).join('；')
+}
+
+function analysisCandidateStandards(candidate) {
+  const rows = candidate.standards || []
+  return rows.map(item => {
+    const grade = item.grade ? `（${item.grade}）` : ''
+    const section = item.section_code || item.section_title || item.clause_label || ''
+    return `《${item.standard_name || '规范'}》${grade}${section ? ` ${section}` : ''}`
+  }).filter(Boolean).join('；')
 }
 
 function standardReviewStatusLabel(status) {
@@ -3636,8 +3731,8 @@ async function saveStandardReviewPage(status = 'completed') {
 async function handleImportStandards() {
   try {
     importingStandards.value = true
-    const result = await api.importStandards({ force: true })
-    ElMessage.success(`规范库导入完成：成功 ${result.imported || 0} 个，需OCR ${result.needs_ocr || 0} 个`)
+    const result = await api.importStandards({ force: false })
+    ElMessage.success(`规范库导入完成：成功 ${result.imported || 0} 个，需OCR ${result.needs_ocr || 0} 个，已保护 ${result.protected || 0} 个`)
     await loadCaseStandardReferences()
   } catch (e) {
     ElMessage.error('规范库导入失败：' + (e.response?.data?.detail || e.message || '未知错误'))
@@ -3660,6 +3755,26 @@ async function loadCaseStandardReferences(silent = false) {
     }
   } finally {
     loadingStandardRefs.value = false
+  }
+}
+
+async function loadAnalysisHarness(silent = false) {
+  try {
+    loadingAnalysisHarness.value = true
+    const result = await api.getAnalysisHarness(caseId)
+    analysisHarness.value = result
+    if (result.standard_references?.length) {
+      standardReferences.value = result.standard_references
+    }
+    if (!silent && !(result.candidates || []).length) {
+      ElMessage.info('暂未形成伤残候选，请先提取病历事实和检查事实')
+    }
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('分析护栏加载失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+    }
+  } finally {
+    loadingAnalysisHarness.value = false
   }
 }
 
@@ -3723,14 +3838,20 @@ async function handleGenerateAnalysis() {
     if (result.analysis) {
       reportData.value.analysis = result.analysis
     }
-    standardReferences.value = result.standard_references || standardReferences.value
+    if ('standard_references' in result) {
+      standardReferences.value = result.standard_references || []
+    }
+    await loadAnalysisHarness(true)
+    if (result.analysis_warnings?.length) {
+      ElMessage.warning(result.analysis_warnings.join('；'))
+    }
     // 提示用户生成方式
     if (result.method === 'fallback') {
       ElMessage.warning('LLM服务暂不可用，已使用拼接模式生成，建议稍后重试')
     } else {
       ElMessage.success('分析说明已生成')
     }
-    await loadCase()
+    // 保留本次生成返回的分析正文和依据分类；重新 loadCase 会把依据刷新回通用候选列表。
   } catch (e) {
     ElMessage.error('分析说明生成失败：' + (e.response?.data?.detail || '未知错误'))
   } finally {
@@ -4723,11 +4844,70 @@ watch(showAddImagingDialog, (val) => {
       margin-bottom: 8px;
     }
 
+    .standard-reference-group + .standard-reference-group {
+      margin-top: 12px;
+    }
+
+    .standard-reference-group-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+      color: #606266;
+      font-size: 12px;
+    }
+
+    .standard-reference-reason {
+      margin-bottom: 8px;
+      color: #909399;
+      font-size: 12px;
+    }
+
     .standard-reference-text {
       white-space: pre-wrap;
       line-height: 1.7;
       color: #606266;
       font-size: 13px;
+    }
+  }
+
+  .analysis-harness-box {
+    margin-bottom: 14px;
+    border: 1px solid #d9ecff;
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: #f5f9ff;
+
+    .analysis-harness-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #303133;
+      margin-bottom: 8px;
+    }
+
+    .analysis-candidate-row {
+      padding: 8px 0;
+      border-top: 1px solid #e4e7ed;
+
+      &:first-of-type {
+        border-top: none;
+      }
+    }
+
+    .analysis-candidate-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+
+    .analysis-candidate-suggestion,
+    .analysis-candidate-meta {
+      color: #606266;
+      font-size: 12px;
+      line-height: 1.6;
     }
   }
 }

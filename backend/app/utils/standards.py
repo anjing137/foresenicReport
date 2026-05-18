@@ -282,8 +282,48 @@ def iter_standard_files(source_dir: Path) -> Iterable[Path]:
             yield path
 
 
+def standard_document_protection_status(document: StandardDocument, db: Session) -> dict:
+    """Return whether a standard document has OCR/proofread/index work that must not be overwritten."""
+    page_count = db.query(StandardPage).filter(StandardPage.document_id == document.id).count()
+    ocr_completed = db.query(StandardPage).filter(
+        StandardPage.document_id == document.id,
+        StandardPage.ocr_status == OcrStatus.COMPLETED,
+    ).count()
+    proofread_count = db.query(StandardPage).filter(
+        StandardPage.document_id == document.id,
+        StandardPage.proofread_text.isnot(None),
+        StandardPage.proofread_text != "",
+    ).count()
+    proofread_confirmed = db.query(StandardPage).filter(
+        StandardPage.document_id == document.id,
+        StandardPage.proofread_status.in_([ProofreadStatus.COMPLETED, ProofreadStatus.NEEDS_REVIEW]),
+    ).count()
+    chunk_count = db.query(StandardChunk).filter(StandardChunk.document_id == document.id).count()
+    return {
+        "protected": bool(proofread_count or proofread_confirmed or ocr_completed or chunk_count),
+        "page_count": page_count,
+        "ocr_completed": ocr_completed,
+        "proofread_count": proofread_count,
+        "proofread_confirmed": proofread_confirmed,
+        "chunk_count": chunk_count,
+    }
+
+
 def import_standard_file(path: Path, db: Session, force: bool = False) -> dict:
     existing = db.query(StandardDocument).filter(StandardDocument.file_path == str(path)).first()
+    if not existing:
+        existing = db.query(StandardDocument).filter(StandardDocument.filename == path.name).first()
+    if existing:
+        protection = standard_document_protection_status(existing, db)
+        if protection["protected"]:
+            return {
+                "filename": path.name,
+                "status": "protected",
+                "document_id": existing.id,
+                "chunk_count": existing.chunk_count,
+                "message": "已存在 OCR、人工核验或检索索引，已保护并跳过导入",
+                **protection,
+            }
     if existing and not force:
         return {
             "filename": path.name,
@@ -379,6 +419,7 @@ def import_standard_library(db: Session, source_dir: Optional[str] = None, force
         "needs_ocr": sum(1 for r in results if r["status"] == "needs_ocr"),
         "failed": sum(1 for r in results if r["status"] == "failed"),
         "skipped": sum(1 for r in results if r["status"] == "skipped"),
+        "protected": sum(1 for r in results if r["status"] == "protected"),
         "results": results,
     }
 
@@ -943,18 +984,31 @@ def chunk_to_reference(chunk: StandardChunk, score: float = 0.0) -> dict:
 
 # ── 三层智能检索：规则映射 → LLM选条款 → 精准检索 ──────────────────────────
 
-# 第一层：委托事项关键词 → 标准文档 ID 的确定性映射
-ENTRUSTMENT_TO_STANDARDS: dict[str, list[int]] = {
-    # key -> 标准文档 title 关键词（用于数据库匹配）
-    "伤残等级": [20],       # 人体损伤致残程度分级
-    "误工期": [29],          # 人身损害误工期、护理期、营养期评定规范
-    "护理期": [29],
-    "营养期": [29],
-    "护理人数": [29],
-    "护理依赖": [28],        # 人身损害护理依赖程度评定
-    "因果关系": [35],        # 人身损害与疾病因果关系判定指南
-    "后续治疗费": [],        # 无对应正式标准，需结合临床实际
-    "后续治疗": [],
+# 第一层：委托事项关键词 → 标准文档标题关键词的确定性映射
+ENTRUSTMENT_TO_STANDARD_TITLES: dict[str, tuple[str, ...]] = {
+    "伤残等级": ("人体损伤致残程度分级", "劳动能力鉴定"),
+    "伤残": ("人体损伤致残程度分级", "劳动能力鉴定"),
+    "残疾": ("人体损伤致残程度分级", "劳动能力鉴定"),
+    "工伤": ("劳动能力鉴定", "职工工伤", "职业病致残等级"),
+    "劳动能力": ("劳动能力鉴定", "职工工伤", "职业病致残等级"),
+    "损伤程度": ("人体损伤程度鉴定标准",),
+    "轻伤": ("人体损伤程度鉴定标准",),
+    "重伤": ("人体损伤程度鉴定标准",),
+    "误工期": ("误工期", "护理期", "营养期"),
+    "护理期": ("误工期", "护理期", "营养期"),
+    "营养期": ("误工期", "护理期", "营养期"),
+    "护理人数": ("误工期", "护理期", "营养期"),
+    "护理依赖": ("护理依赖",),
+    "因果关系": ("因果关系",),
+    "参与度": ("因果关系",),
+    "视觉": ("视觉功能障碍",),
+    "视力": ("视觉功能障碍",),
+    "听觉": ("听觉功能障碍",),
+    "听力": ("听觉功能障碍",),
+    "关节活动": ("关节活动度",),
+    "癫痫": ("外伤性癫痫",),
+    "后续治疗费": (),        # 无对应正式标准，需结合临床实际
+    "后续治疗": (),
 }
 
 
@@ -964,18 +1018,30 @@ def _parse_entrustment_items(entrustment: str) -> list[str]:
     return [it.strip() for it in items if it.strip()]
 
 
-def _map_entrustment_to_standard_ids(items: list[str]) -> dict[str, set[int]]:
-    """将每个委托事项映射到相关的标准文档 ID 集合
+def _standard_ids_by_title_keywords(db: Session, title_keywords: tuple[str, ...]) -> set[int]:
+    if not title_keywords:
+        return set()
+    docs = db.query(StandardDocument).all()
+    matched: set[int] = set()
+    for doc in docs:
+        haystack = f"{doc.title or ''} {doc.filename or ''}"
+        if any(keyword and keyword in haystack for keyword in title_keywords):
+            matched.add(doc.id)
+    return matched
+
+
+def _map_entrustment_to_standard_ids(items: list[str], db: Session) -> dict[str, set[int]]:
+    """将每个委托事项映射到相关标准文档 ID。
 
     Returns:
-        {"伤残等级": {20}, "误工期": {29}, ...}
+        {"伤残等级": {47}, "误工期": {56}, ...}
     """
     result: dict[str, set[int]] = {}
     for item in items:
         matched_ids: set[int] = set()
-        for keyword, doc_ids in ENTRUSTMENT_TO_STANDARDS.items():
+        for keyword, title_keywords in ENTRUSTMENT_TO_STANDARD_TITLES.items():
             if keyword in item:
-                matched_ids.update(doc_ids)
+                matched_ids.update(_standard_ids_by_title_keywords(db, title_keywords))
         result[item] = matched_ids
     return result
 

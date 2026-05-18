@@ -381,7 +381,10 @@ def call_llm_text_harness(
             break
 
         content = (result.get("content") or "").strip()
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+        content = re.sub(r"<think\b[^>]*>.*?</think>", "", content, flags=re.S | re.I).strip()
+        if re.search(r"<think\b", content, flags=re.I):
+            final_match = re.search(r"(根据委托单位提供的现有材料|按照《|复阅\d{4}年|1\.)", content)
+            content = content[final_match.start():].strip() if final_match else ""
         if content.startswith("```"):
             lines = content.split("\n")
             if lines and lines[0].startswith("```"):
