@@ -30,6 +30,9 @@ from app.utils.standards import (
 from app.utils.analysis_harness import (
     build_analysis_harness_payload,
     format_analysis_harness_for_prompt,
+    list_saved_analysis_candidates,
+    sync_analysis_candidates,
+    update_saved_analysis_candidate,
     validate_analysis_text,
 )
 
@@ -944,6 +947,54 @@ def get_analysis_harness_api(case_id: int, db: Session = Depends(get_db)):
     if not case:
         raise HTTPException(status_code=404, detail="案件不存在")
     return build_analysis_harness_payload(case_id, db)
+
+
+@router.get("/cases/{case_id}/analysis-candidates")
+def list_analysis_candidates_api(case_id: int, db: Session = Depends(get_db)):
+    """读取已落库的分析候选；如尚未生成，则自动生成一版。"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    candidates = list_saved_analysis_candidates(case_id, db)
+    if not candidates:
+        payload = sync_analysis_candidates(case_id, db)
+        return {
+            "candidates": payload.get("candidates", []),
+            "warnings": payload.get("warnings", []),
+            "standard_references": payload.get("standard_references", []),
+        }
+    return {"candidates": candidates, "warnings": [], "standard_references": []}
+
+
+@router.post("/cases/{case_id}/analysis-candidates/refresh")
+def refresh_analysis_candidates_api(case_id: int, db: Session = Depends(get_db)):
+    """重新计算候选并落库，保留医生已采信/排除状态。"""
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="案件不存在")
+    payload = sync_analysis_candidates(case_id, db)
+    return {
+        "candidates": payload.get("candidates", []),
+        "warnings": payload.get("warnings", []),
+        "standard_references": payload.get("standard_references", []),
+    }
+
+
+@router.put("/analysis-candidates/{candidate_id}")
+def update_analysis_candidate_api(candidate_id: int, payload: dict, db: Session = Depends(get_db)):
+    """更新分析候选核验状态。"""
+    try:
+        candidate = update_saved_analysis_candidate(
+            candidate_id,
+            db,
+            status=payload.get("status"),
+            review_note=payload.get("review_note"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not candidate:
+        raise HTTPException(status_code=404, detail="分析候选不存在")
+    return candidate
 
 
 @router.post("/cases/{case_id}/generate-opinion")
@@ -1897,7 +1948,7 @@ def _generate_analysis(case_id: int, db) -> dict:
         })
 
     # 分析说明护栏：先形成案件事实、伤残候选和精准条款，再交给 LLM 写正文
-    harness_payload = build_analysis_harness_payload(case_id, db)
+    harness_payload = sync_analysis_candidates(case_id, db)
     harness_context = format_analysis_harness_for_prompt(harness_payload)
 
     # 三层智能检索（作为补充，不再直接支配伤残候选）
@@ -1936,8 +1987,8 @@ def _generate_analysis(case_id: int, db) -> dict:
 - 第1条确认外伤来源，第2条确认所有伤情诊断
 - 第3条起只逐一分析【委托鉴定事项】列明的项目，不得增加未委托事项
 - 必须先遵守【分析说明护栏】；案件基础事实以护栏为准，不得套用示例中的姓名、性别、年龄
-- 伤残等级只能对护栏中 decision=met 的候选写正式结论；decision=uncertain 的候选只能写为需核对或辅助事实，不得直接定级
-- 必须覆盖所有 decision=met 的候选；不得把未在护栏中满足的候选写成正式伤残结论
+- 伤残等级只能对护栏中 status=accepted 且 decision=met 的候选写正式结论；needs_review/pending/excluded 候选只能写为需核对或辅助事实，不得直接定级
+- 必须覆盖所有 status=accepted 且 decision=met 的候选；不得把未被采信的候选写成正式伤残结论
 - 条款号和条款内容必须优先使用护栏给出的规范；不得把髋关节置换误写成其他不相干条款
 - 引用条款时，只能引用【拟引用规范依据】中的具体条款号和条款内容；【辅助判断依据】只能用于事实判断，不得写成结论依据
 - 如果拟引用依据不足以支撑某个具体条款号，应写"参照相关规定并结合临床资料综合评定"，不要编造条款号

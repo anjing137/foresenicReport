@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.case import (
+    AnalysisCandidate,
+    AnalysisCandidateStatus,
     Case,
     FactReviewStatus,
     HospitalRecord,
@@ -63,7 +66,7 @@ CLAUSE_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 
-def build_analysis_harness_payload(case_id: int, db: Session) -> dict[str, Any]:
+def build_analysis_harness_payload(case_id: int, db: Session, attach_saved_status: bool = True) -> dict[str, Any]:
     """返回分析说明生成前的结构化核验材料。"""
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
@@ -87,6 +90,8 @@ def build_analysis_harness_payload(case_id: int, db: Session) -> dict[str, Any]:
 
     candidates = _build_injury_candidates(db, records, events, imaging)
     candidates.extend(_build_period_candidates(db, records, events, imaging, case.entrustment_matter or ""))
+    if attach_saved_status:
+        _attach_saved_candidate_status(case_id, db, candidates)
     references = _collect_standard_references(candidates)
     warnings = _build_warnings(case, records, events, imaging, candidates)
 
@@ -107,6 +112,88 @@ def build_analysis_harness_payload(case_id: int, db: Session) -> dict[str, Any]:
     }
 
 
+def sync_analysis_candidates(case_id: int, db: Session, _retry_on_conflict: bool = True) -> dict[str, Any]:
+    """刷新候选清单并落库；保留医生已修改的状态。"""
+    payload = build_analysis_harness_payload(case_id, db, attach_saved_status=False)
+    now = datetime.now()
+    existing_rows = {
+        row.candidate_key: row
+        for row in db.query(AnalysisCandidate).filter(AnalysisCandidate.case_id == case_id).all()
+    }
+
+    for item in payload.get("candidates") or []:
+        key = item.get("id")
+        if not key:
+            continue
+        row = existing_rows.get(key)
+        default_status = _default_candidate_status(item)
+        if not row:
+            row = AnalysisCandidate(
+                case_id=case_id,
+                candidate_key=key,
+                status=default_status,
+                created_at=now,
+            )
+            db.add(row)
+        row.title = item.get("title")
+        row.category = item.get("category")
+        row.decision = item.get("decision")
+        row.confidence = item.get("confidence")
+        row.grade = item.get("grade")
+        row.suggestion = item.get("suggestion")
+        row.reason = item.get("reason")
+        row.evidence_json = json.dumps(item.get("evidence") or [], ensure_ascii=False)
+        row.standards_json = json.dumps(item.get("standards") or [], ensure_ascii=False)
+        row.warnings_json = json.dumps(item.get("warnings") or [], ensure_ascii=False)
+        row.source = "analysis_harness"
+        row.updated_at = now
+        if row.status not in AnalysisCandidateStatus.ALL:
+            row.status = default_status
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if not _retry_on_conflict:
+            raise
+        return sync_analysis_candidates(case_id, db, _retry_on_conflict=False)
+    payload["candidates"] = list_saved_analysis_candidates(case_id, db)
+    payload["standard_references"] = _collect_standard_references(payload["candidates"])
+    return payload
+
+
+def list_saved_analysis_candidates(case_id: int, db: Session) -> list[dict[str, Any]]:
+    rows = (
+        db.query(AnalysisCandidate)
+        .filter(AnalysisCandidate.case_id == case_id)
+        .order_by(AnalysisCandidate.id.asc())
+        .all()
+    )
+    return [_candidate_row_to_dict(row) for row in rows]
+
+
+def update_saved_analysis_candidate(
+    candidate_id: int,
+    db: Session,
+    *,
+    status: str | None = None,
+    review_note: str | None = None,
+) -> dict[str, Any] | None:
+    row = db.query(AnalysisCandidate).filter(AnalysisCandidate.id == candidate_id).first()
+    if not row:
+        return None
+    if status is not None:
+        if status not in AnalysisCandidateStatus.ALL:
+            raise ValueError(f"不支持的候选状态：{status}")
+        row.status = status
+    if review_note is not None:
+        row.review_note = review_note
+    row.updated_at = datetime.now()
+    db.commit()
+    db.refresh(row)
+    return _candidate_row_to_dict(row)
+
+
 def format_analysis_harness_for_prompt(payload: dict[str, Any]) -> str:
     """把护栏材料压缩成给大模型使用的提示词上下文。"""
     case_context = payload.get("case_context") or {}
@@ -117,7 +204,7 @@ def format_analysis_harness_for_prompt(payload: dict[str, Any]) -> str:
         f"- 委托事项：{case_context.get('entrustment_matter') or '未明'}",
         f"- 事故时间：{case_context.get('accident_date') or '未明'}；事故地点：{case_context.get('accident_location') or '未明'}",
         "",
-        "【伤残/三期候选清单（正式结论只能从 decision=met 中选择；decision=uncertain 只能提示人工核对，不得直接定级）】",
+        "【伤残/三期候选清单（正式结论只能从 status=accepted 且 decision=met 中选择；needs_review/pending/excluded 不得直接定级）】",
     ]
 
     candidates = payload.get("candidates") or []
@@ -128,15 +215,18 @@ def format_analysis_harness_for_prompt(payload: dict[str, Any]) -> str:
         evidence = "；".join(_format_evidence_brief(ev) for ev in (item.get("evidence") or [])[:5]) or "未列出来源"
         lines.extend(
             [
-                f"- [{item.get('decision')}] {item.get('title')}",
+                f"- [{item.get('decision')}; status={item.get('status') or _default_candidate_status(item)}] {item.get('title')}",
                 f"  类别：{item.get('category') or ''}；建议/范围：{item.get('suggestion') or item.get('grade') or ''}",
                 f"  理由：{item.get('reason') or ''}",
                 f"  来源：{evidence}",
                 f"  规范：{standards}",
             ]
         )
-        if item.get("warnings"):
-            lines.append(f"  风险提示：{'；'.join(item['warnings'])}")
+        warning_text = list(item.get("warnings") or [])
+        if item.get("status") in (AnalysisCandidateStatus.EXCLUDED, AnalysisCandidateStatus.NEEDS_REVIEW):
+            warning_text.append("该候选未被采信，正文不得写成正式结论。")
+        if warning_text:
+            lines.append(f"  风险提示：{'；'.join(warning_text)}")
 
     warnings = payload.get("warnings") or []
     if warnings:
@@ -157,7 +247,11 @@ def validate_analysis_text(text: str, payload: dict[str, Any]) -> list[str]:
         if re.search(rf"{re.escape(person_name)}[，,、:：]*(?:现年\d+岁)?{wrong_gender}", compact):
             warnings.append(f"分析说明中可能出现被鉴定人性别错误，应以基本情况中的“{gender}”为准。")
 
-    met_candidates = [item for item in payload.get("candidates") or [] if item.get("decision") == "met"]
+    met_candidates = [
+        item
+        for item in payload.get("candidates") or []
+        if item.get("decision") == "met" and (item.get("status") or _default_candidate_status(item)) == AnalysisCandidateStatus.ACCEPTED
+    ]
     for item in met_candidates:
         required = item.get("must_mention") or []
         if required and not any(term in (text or "") for term in required):
@@ -188,6 +282,51 @@ def _build_case_context(case: Case, person: Person | None, report: Report | None
         "accident_description": case.accident_description,
         "case_facts": report.case_facts if report else "",
         "clinical_examination": case.clinical_examination,
+    }
+
+
+def _attach_saved_candidate_status(case_id: int, db: Session, candidates: list[dict[str, Any]]) -> None:
+    rows = {
+        row.candidate_key: row
+        for row in db.query(AnalysisCandidate).filter(AnalysisCandidate.case_id == case_id).all()
+    }
+    for item in candidates:
+        row = rows.get(item.get("id"))
+        if row:
+            item["candidate_db_id"] = row.id
+            item["status"] = row.status
+            item["review_note"] = row.review_note
+        else:
+            item["status"] = _default_candidate_status(item)
+
+
+def _default_candidate_status(item: dict[str, Any]) -> str:
+    if item.get("decision") == "met" and int(item.get("confidence") or 0) >= 80:
+        return AnalysisCandidateStatus.ACCEPTED
+    if item.get("decision") == "uncertain":
+        return AnalysisCandidateStatus.NEEDS_REVIEW
+    return AnalysisCandidateStatus.PENDING
+
+
+def _candidate_row_to_dict(row: AnalysisCandidate) -> dict[str, Any]:
+    return {
+        "candidate_db_id": row.id,
+        "id": row.candidate_key,
+        "title": row.title,
+        "category": row.category,
+        "decision": row.decision,
+        "status": row.status,
+        "confidence": row.confidence,
+        "grade": row.grade,
+        "suggestion": row.suggestion,
+        "reason": row.reason,
+        "evidence": _json_list(row.evidence_json),
+        "standards": _json_list(row.standards_json),
+        "warnings": _json_list(row.warnings_json),
+        "review_note": row.review_note,
+        "source": row.source,
+        "created_at": row.created_at.isoformat(timespec="seconds") if row.created_at else None,
+        "updated_at": row.updated_at.isoformat(timespec="seconds") if row.updated_at else None,
     }
 
 
@@ -577,7 +716,8 @@ def _collect_standard_references(candidates: list[dict[str, Any]]) -> list[dict[
     seen: set[str] = set()
     refs: list[dict[str, Any]] = []
     for item in candidates:
-        if item.get("decision") not in ("met", "uncertain"):
+        status = item.get("status") or _default_candidate_status(item)
+        if item.get("decision") != "met" or status != AnalysisCandidateStatus.ACCEPTED:
             continue
         for ref in item.get("standards") or []:
             key = str(ref.get("clause_key") or ref.get("id") or ref.get("clause_label"))

@@ -1042,8 +1042,8 @@
                 <el-button size="small" plain @click="loadCaseStandardReferences" :loading="loadingStandardRefs">
                   <el-icon><Search /></el-icon> 刷新依据
                 </el-button>
-                <el-button size="small" plain @click="loadAnalysisHarness(false)" :loading="loadingAnalysisHarness">
-                  <el-icon><Search /></el-icon> 伤残候选
+                <el-button size="small" plain @click="refreshAnalysisCandidates(false)" :loading="loadingAnalysisHarness">
+                  <el-icon><Search /></el-icon> 刷新候选
                 </el-button>
                 <span style="color: #999; font-size: 12px; margin-left: 8px;">基于住院记录和检查报告自动生成分析说明</span>
               </div>
@@ -1079,8 +1079,29 @@
                     <el-tag size="small" :type="analysisCandidateTag(candidate.decision)">
                       {{ candidate.decision === 'met' ? '可采信' : candidate.decision === 'uncertain' ? '需核对' : candidate.decision }}
                     </el-tag>
+                    <el-tag size="small" effect="plain" :type="analysisCandidateStatusTag(candidate.status)">
+                      {{ analysisCandidateStatusLabel(candidate.status) }}
+                    </el-tag>
                     <strong>{{ candidate.title }}</strong>
                     <span class="analysis-candidate-suggestion">{{ candidate.suggestion || candidate.grade }}</span>
+                    <el-button
+                      v-if="!isCompleted && candidate.status !== 'accepted'"
+                      link
+                      type="success"
+                      @click="updateAnalysisCandidateStatus(candidate, 'accepted')"
+                    >采信</el-button>
+                    <el-button
+                      v-if="!isCompleted && candidate.status !== 'excluded'"
+                      link
+                      type="danger"
+                      @click="updateAnalysisCandidateStatus(candidate, 'excluded')"
+                    >排除</el-button>
+                    <el-button
+                      v-if="!isCompleted && candidate.status !== 'needs_review'"
+                      link
+                      type="warning"
+                      @click="updateAnalysisCandidateStatus(candidate, 'needs_review')"
+                    >待核对</el-button>
                   </div>
                   <div class="analysis-candidate-meta">理由：{{ candidate.reason }}</div>
                   <div class="analysis-candidate-meta">来源：{{ analysisCandidateEvidence(candidate) }}</div>
@@ -1942,13 +1963,22 @@ const importingStandards = ref(false)
 const loadingStandardRefs = ref(false)
 const loadingAnalysisHarness = ref(false)
 const standardReferences = ref([])
-const analysisHarness = ref(null)
-const analysisHarnessCandidates = computed(() => analysisHarness.value?.candidates || [])
-const analysisHarnessWarnings = computed(() => analysisHarness.value?.warnings || [])
+const analysisCandidates = ref([])
+const analysisCandidateWarnings = ref([])
+const analysisHarnessCandidates = computed(() => analysisCandidates.value || [])
+const analysisHarnessWarnings = computed(() => analysisCandidateWarnings.value || [])
 const analysisCandidateTag = (decision) => {
   if (decision === 'met') return 'success'
   if (decision === 'uncertain') return 'warning'
   return 'info'
+}
+const analysisCandidateStatusTag = (status) => {
+  const map = { accepted: 'success', excluded: 'danger', needs_review: 'warning', pending: 'info' }
+  return map[status] || 'info'
+}
+const analysisCandidateStatusLabel = (status) => {
+  const map = { accepted: '已采信', excluded: '已排除', needs_review: '需核对', pending: '待核验' }
+  return map[status] || status || '待核验'
 }
 const standardReferenceGroups = computed(() => {
   const groups = [
@@ -3761,12 +3791,13 @@ async function loadCaseStandardReferences(silent = false) {
 async function loadAnalysisHarness(silent = false) {
   try {
     loadingAnalysisHarness.value = true
-    const result = await api.getAnalysisHarness(caseId)
-    analysisHarness.value = result
+    const result = await api.getAnalysisCandidates(caseId)
+    analysisCandidates.value = result.candidates || []
+    analysisCandidateWarnings.value = result.warnings || []
     if (result.standard_references?.length) {
       standardReferences.value = result.standard_references
     }
-    if (!silent && !(result.candidates || []).length) {
+    if (!silent && !analysisCandidates.value.length) {
       ElMessage.info('暂未形成伤残候选，请先提取病历事实和检查事实')
     }
   } catch (e) {
@@ -3775,6 +3806,44 @@ async function loadAnalysisHarness(silent = false) {
     }
   } finally {
     loadingAnalysisHarness.value = false
+  }
+}
+
+async function refreshAnalysisCandidates(silent = false) {
+  try {
+    loadingAnalysisHarness.value = true
+    const result = await api.refreshAnalysisCandidates(caseId)
+    analysisCandidates.value = result.candidates || []
+    analysisCandidateWarnings.value = result.warnings || []
+    if (result.standard_references?.length) {
+      standardReferences.value = result.standard_references
+    }
+    if (!silent) {
+      ElMessage.success(`已刷新 ${analysisCandidates.value.length} 个分析候选`)
+    }
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('刷新分析候选失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+    }
+  } finally {
+    loadingAnalysisHarness.value = false
+  }
+}
+
+async function updateAnalysisCandidateStatus(candidate, status) {
+  if (!candidate?.candidate_db_id) {
+    ElMessage.warning('该候选尚未落库，请先刷新候选')
+    return
+  }
+  try {
+    const result = await api.updateAnalysisCandidate(candidate.candidate_db_id, { status })
+    const idx = analysisCandidates.value.findIndex(item => item.candidate_db_id === candidate.candidate_db_id)
+    if (idx >= 0) {
+      analysisCandidates.value[idx] = result
+    }
+    ElMessage.success(`已标记为${analysisCandidateStatusLabel(status)}`)
+  } catch (e) {
+    ElMessage.error('更新候选状态失败：' + (e.response?.data?.detail || e.message || '未知错误'))
   }
 }
 

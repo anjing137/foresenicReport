@@ -3,7 +3,7 @@
 基于 PRD v1.0 设计
 """
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -70,6 +70,15 @@ class FactReviewStatus:
     NEEDS_EDIT = "needs_edit"        # 需修改
 
     ALL = [PENDING, CONFIRMED, NEEDS_EDIT]
+
+
+class AnalysisCandidateStatus:
+    PENDING = "pending"              # 待核验
+    ACCEPTED = "accepted"            # 已采信
+    EXCLUDED = "excluded"            # 已排除
+    NEEDS_REVIEW = "needs_review"    # 需核对
+
+    ALL = [PENDING, ACCEPTED, EXCLUDED, NEEDS_REVIEW]
 
 
 class ProofreadStatus:
@@ -296,6 +305,34 @@ class MedicalEvent(Base):
     case = relationship("Case", back_populates="medical_events")
     hospital_record = relationship("HospitalRecord")
     group = relationship("MaterialGroup")
+
+
+class AnalysisCandidate(Base):
+    """分析说明候选：保存系统提出的伤残/三期候选及医生核验状态。"""
+    __tablename__ = "analysis_candidates"
+    __table_args__ = (UniqueConstraint("case_id", "candidate_key", name="uq_analysis_candidate_case_key"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=False, index=True, comment="关联案件")
+    candidate_key = Column(String(100), nullable=False, comment="候选稳定键")
+
+    title = Column(String(200), comment="候选标题")
+    category = Column(String(50), comment="候选类别：伤残等级/三期/因果关系等")
+    decision = Column(String(30), comment="系统判定：met/uncertain/not_met")
+    status = Column(String(30), default=AnalysisCandidateStatus.PENDING, comment="医生核验状态")
+    confidence = Column(Integer, comment="系统置信度")
+    grade = Column(String(100), comment="建议等级或类型")
+    suggestion = Column(Text, comment="系统建议")
+    reason = Column(Text, comment="系统理由")
+
+    evidence_json = Column(Text, comment="来源证据 JSON")
+    standards_json = Column(Text, comment="规范依据 JSON")
+    warnings_json = Column(Text, comment="风险提示 JSON")
+    review_note = Column(Text, comment="医生核验备注")
+    source = Column(String(50), default="analysis_harness", comment="来源")
+
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
 
 
 class Report(Base):
