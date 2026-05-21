@@ -135,6 +135,13 @@ export default {
   updateMedicalEvent: (id, data) => api.put(`/medical-events/${id}`, data),
   deleteMedicalEvent: (id) => api.delete(`/medical-events/${id}`),
 
+  // ===== 统一事实库 =====
+  getUnifiedFacts: (caseId) => api.get(`/facts/case/${caseId}`),
+  buildUnifiedFacts: (caseId) => api.post(`/facts/case/${caseId}/build`, null, { timeout: 30 * 60 * 1000 }),
+  syncUnifiedFacts: (caseId) => api.post(`/facts/case/${caseId}/sync`),
+  updateUnifiedFact: (factId, data) => api.put(`/facts/${factId}`, data),
+  getUnifiedFactSourcePages: (factId) => api.get(`/facts/${factId}/source-pages`),
+
   // ===== 影像学报告 =====
   getImagingReports: (caseId) => api.get(`/imaging-reports/case/${caseId}`),
   getImagingReportSourcePages: (id) => api.get(`/imaging-reports/${id}/source-pages`),
@@ -185,7 +192,6 @@ export default {
   updateAnalysisCandidate: (candidateId, data) => api.put(`/llm/analysis-candidates/${candidateId}`, data),
   generateAnalysis: (caseId) => api.post(`/llm/cases/${caseId}/generate-analysis`),
   generateOpinion: (caseId) => api.post(`/llm/cases/${caseId}/generate-opinion`),
-  generateFullReport: (caseId) => api.post(`/llm/cases/${caseId}/generate-full-report`, null, { timeout: 10 * 60 * 1000 }),
 
   // ===== 系统配置 =====
   getAppraiser: () => api.get('/settings/appraiser'),

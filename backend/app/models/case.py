@@ -66,10 +66,20 @@ class OcrStatus:
 
 class FactReviewStatus:
     PENDING = "pending"              # 待核验
+    SYSTEM_VERIFIED = "system_verified"  # 系统预采信
     CONFIRMED = "confirmed"          # 已确认
     NEEDS_EDIT = "needs_edit"        # 需修改
+    EXCLUDED = "excluded"            # 已排除
 
-    ALL = [PENDING, CONFIRMED, NEEDS_EDIT]
+    ALL = [PENDING, SYSTEM_VERIFIED, CONFIRMED, NEEDS_EDIT, EXCLUDED]
+
+
+class FactImportance:
+    CORE = "core"                    # 核心事实：直接支撑鉴定意见
+    SUPPORTING = "supporting"        # 辅助事实：可作为背景或佐证
+    EXCLUDED = "excluded"            # 不采用事实
+
+    ALL = [CORE, SUPPORTING, EXCLUDED]
 
 
 class AnalysisCandidateStatus:
@@ -135,6 +145,7 @@ class Case(Base):
     hospital_records = relationship("HospitalRecord", back_populates="case", cascade="all, delete-orphan")
     medical_events = relationship("MedicalEvent", back_populates="case", cascade="all, delete-orphan")
     imaging_reports = relationship("ImagingReport", back_populates="case", cascade="all, delete-orphan")
+    unified_facts = relationship("UnifiedFact", back_populates="case", cascade="all, delete-orphan")
     report = relationship("Report", back_populates="case", uselist=False, cascade="all, delete-orphan")
     style_logs = relationship("StyleLog", back_populates="case", cascade="all, delete-orphan")
 
@@ -305,6 +316,40 @@ class MedicalEvent(Base):
     case = relationship("Case", back_populates="medical_events")
     hospital_record = relationship("HospitalRecord")
     group = relationship("MaterialGroup")
+
+
+class UnifiedFact(Base):
+    """统一事实库：下游资料摘要、鉴定过程、分析说明的唯一事实入口。"""
+    __tablename__ = "unified_facts"
+    __table_args__ = (UniqueConstraint("case_id", "fact_key", name="uq_unified_fact_case_key"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=False, index=True, comment="关联案件")
+    fact_key = Column(String(120), nullable=False, comment="稳定事实键")
+
+    fact_type = Column(String(50), nullable=False, comment="事实类型：case_basic/case_facts/hospital_record/medical_event/imaging_report/clinical_exam")
+    fact_role = Column(String(50), comment="事实角色：admission/discharge/surgery/imaging/diagnosis等")
+    fact_date = Column(String(50), comment="事实日期或时间")
+    hospital_name = Column(String(200), comment="医院名称")
+    title = Column(String(200), comment="事实标题")
+    summary = Column(Text, comment="事实摘要")
+    source_quote = Column(Text, comment="来源原文或依据")
+
+    source_kind = Column(String(50), comment="来源表类型")
+    source_id = Column(Integer, comment="来源记录ID")
+    source_material_ids = Column(Text, comment="来源材料ID列表 JSON")
+    source_page_numbers = Column(Text, comment="来源页码列表 JSON")
+
+    review_status = Column(String(20), default=FactReviewStatus.PENDING, comment="事实核验状态")
+    importance = Column(String(20), default=FactImportance.SUPPORTING, comment="事实重要性")
+    extraction_confidence = Column(Integer, comment="提取置信度 0-100")
+    quality_flags = Column(Text, comment="质量标记 JSON")
+    review_note = Column(Text, comment="医生核验备注")
+
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    case = relationship("Case", back_populates="unified_facts")
 
 
 class AnalysisCandidate(Base):

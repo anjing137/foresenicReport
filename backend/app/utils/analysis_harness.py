@@ -18,6 +18,7 @@ from app.models.case import (
     AnalysisCandidate,
     AnalysisCandidateStatus,
     Case,
+    FactImportance,
     FactReviewStatus,
     HospitalRecord,
     ImagingReport,
@@ -25,45 +26,10 @@ from app.models.case import (
     Person,
     Report,
     StandardChunk,
+    UnifiedFact,
 )
 from app.utils.standards import chunk_to_reference
-
-
-CLAUSE_CATALOG: dict[str, dict[str, Any]] = {
-    "disability_hip_joint_replacement_9": {
-        "standard_name": "人体损伤致残程度分级",
-        "category": "伤残等级",
-        "grade": "九级",
-        "clause_label": "脊柱、骨盆及四肢损伤：四肢任一大关节行关节假体置换术后",
-        "search_terms": ("四肢任一大关节行关节假体置换术后", "关节假体置换术后", "大关节行关节假体"),
-    },
-    "disability_rib_fractures_6_10": {
-        "standard_name": "人体损伤致残程度分级",
-        "category": "伤残等级",
-        "grade": "十级",
-        "clause_label": "颈部及胸部损伤：肋骨骨折6根以上，或者肋骨部分缺失2根以上；肋骨骨折4根以上并后遗2处畸形愈合",
-        "search_terms": ("肋骨骨折6根以上", "肋骨部分缺失2根以上", "畸形愈合"),
-    },
-    "period_femoral_neck_fracture_surgery": {
-        "standard_name": "人身损害误工期、护理期、营养期评定规范",
-        "category": "三期",
-        "clause_label": "10.2.8 股骨颈骨折；手术治疗：误工180-365日，护理90-150日，营养90-180日",
-        "ranges": {"误工期": "180-365日", "护理期": "90-150日", "营养期": "90-180日"},
-        "search_terms": ("股骨颈骨折", "手术治疗：误工180", "护理90", "营养90"),
-    },
-    "period_multiple_injuries": {
-        "standard_name": "人身损害误工期、护理期、营养期评定规范",
-        "category": "三期",
-        "clause_label": "附录A.4 多处损伤不能简单累加，应以较长期限为主并结合其他损伤综合考虑",
-        "search_terms": ("多处损伤", "不能将多处损伤", "简单累加"),
-    },
-    "period_upper_limit": {
-        "standard_name": "人身损害误工期、护理期、营养期评定规范",
-        "category": "三期",
-        "clause_label": "附录A.5 受伤后至定残之日前一日的时间已超过误工期上限的，可计算至定残日前一日",
-        "search_terms": ("定残之日前一日", "误工期上限", "超过误工期"),
-    },
-}
+from app.utils.standard_clause_catalog import CLAUSE_CATALOG, INJURY_CANDIDATE_SPECS, PERIOD_CANDIDATE_SPECS
 
 
 def build_analysis_harness_payload(case_id: int, db: Session, attach_saved_status: bool = True) -> dict[str, Any]:
@@ -87,13 +53,14 @@ def build_analysis_harness_payload(case_id: int, db: Session, attach_saved_statu
         .order_by(ImagingReport.report_datetime.asc().nullslast(), ImagingReport.report_date.asc().nullslast(), ImagingReport.id.asc())
         .all()
     )
+    unified_facts = _select_unified_analysis_facts(case_id, db)
 
-    candidates = _build_injury_candidates(db, records, events, imaging)
-    candidates.extend(_build_period_candidates(db, records, events, imaging, case.entrustment_matter or ""))
+    candidates = _build_injury_candidates(db, records, events, imaging, unified_facts)
+    candidates.extend(_build_period_candidates(db, records, events, imaging, case.entrustment_matter or "", unified_facts))
     if attach_saved_status:
         _attach_saved_candidate_status(case_id, db, candidates)
     references = _collect_standard_references(candidates)
-    warnings = _build_warnings(case, records, events, imaging, candidates)
+    warnings = _build_warnings(case, records, events, imaging, candidates, unified_facts)
 
     return {
         "case_context": _build_case_context(case, person, report),
@@ -101,6 +68,7 @@ def build_analysis_harness_payload(case_id: int, db: Session, attach_saved_statu
             "hospital_records": len(records),
             "medical_events": len(events),
             "imaging_reports": len(imaging),
+            "unified_facts": len(unified_facts),
         },
         "narrative_context": {
             "material_summary": (report.material_summary or "") if report else "",
@@ -120,11 +88,13 @@ def sync_analysis_candidates(case_id: int, db: Session, _retry_on_conflict: bool
         row.candidate_key: row
         for row in db.query(AnalysisCandidate).filter(AnalysisCandidate.case_id == case_id).all()
     }
+    current_keys: set[str] = set()
 
     for item in payload.get("candidates") or []:
         key = item.get("id")
         if not key:
             continue
+        current_keys.add(key)
         row = existing_rows.get(key)
         default_status = _default_candidate_status(item)
         if not row:
@@ -150,6 +120,15 @@ def sync_analysis_candidates(case_id: int, db: Session, _retry_on_conflict: bool
         if row.status not in AnalysisCandidateStatus.ALL:
             row.status = default_status
 
+    for key, row in existing_rows.items():
+        if key in current_keys or row.source != "analysis_harness":
+            continue
+        row.decision = "not_met"
+        row.status = AnalysisCandidateStatus.EXCLUDED
+        row.reason = "当前统一事实库已不再支持该候选；如需恢复，请在事实库中重新确认相关事实后刷新候选。"
+        row.warnings_json = json.dumps(["当前事实库已排除或未保留该候选所需证据。"], ensure_ascii=False)
+        row.updated_at = now
+
     try:
         db.commit()
     except IntegrityError:
@@ -162,14 +141,21 @@ def sync_analysis_candidates(case_id: int, db: Session, _retry_on_conflict: bool
     return payload
 
 
-def list_saved_analysis_candidates(case_id: int, db: Session) -> list[dict[str, Any]]:
-    rows = (
-        db.query(AnalysisCandidate)
-        .filter(AnalysisCandidate.case_id == case_id)
-        .order_by(AnalysisCandidate.id.asc())
-        .all()
-    )
+def list_saved_analysis_candidates(
+    case_id: int,
+    db: Session,
+    *,
+    include_excluded: bool = False,
+) -> list[dict[str, Any]]:
+    query = db.query(AnalysisCandidate).filter(AnalysisCandidate.case_id == case_id)
+    if not include_excluded:
+        query = query.filter(AnalysisCandidate.status != AnalysisCandidateStatus.EXCLUDED)
+    rows = query.order_by(AnalysisCandidate.id.asc()).all()
     return [_candidate_row_to_dict(row) for row in rows]
+
+
+def collect_candidate_standard_references(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _collect_standard_references(candidates)
 
 
 def update_saved_analysis_candidate(
@@ -262,6 +248,40 @@ def validate_analysis_text(text: str, payload: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def repair_analysis_text(text: str, payload: dict[str, Any]) -> str:
+    """修正常见的条款号幻觉，不改动事实结论本身。"""
+    if not text:
+        return text
+    met_ids = {
+        item.get("id")
+        for item in payload.get("candidates") or []
+        if item.get("decision") == "met" and (item.get("status") or _default_candidate_status(item)) == AnalysisCandidateStatus.ACCEPTED
+    }
+    if "hip_joint_replacement" in met_ids:
+        replacement = "《人体损伤致残程度分级》中关于“四肢任一大关节行关节假体置换术后”的规定"
+        text = re.sub(
+            r"《人体损伤致残程度分级》第5\.9\.2条(?:[（(][^）)]*[）)])?之规定",
+            replacement,
+            text,
+        )
+        text = re.sub(
+            r"《人体损伤致残程度分级》第5\.9\.2条(?:[（(][^）)]*[）)])?",
+            replacement,
+            text,
+        )
+        text = re.sub(
+            r"《人体损伤致残程度分级》第5\.9\.\d+条(?:\d+[）)](?:项|款))?[（(]四肢任一大关节行关节假体置换术后[）)]之规定",
+            replacement,
+            text,
+        )
+        text = re.sub(
+            r"《人体损伤致残程度分级》第5\.9\.\d+条(?:\d+[）)](?:项|款))?[（(]四肢任一大关节行关节假体置换术后[）)]",
+            replacement,
+            text,
+        )
+    return text
+
+
 def _build_case_context(case: Case, person: Person | None, report: Report | None) -> dict[str, Any]:
     person_name = (person.name if person else None) or case.person_name or "被鉴定人"
     accident_date = _extract_date(case.accident_date or "")
@@ -308,6 +328,25 @@ def _default_candidate_status(item: dict[str, Any]) -> str:
     return AnalysisCandidateStatus.PENDING
 
 
+def _select_unified_analysis_facts(case_id: int, db: Session) -> list[UnifiedFact]:
+    facts = (
+        db.query(UnifiedFact)
+        .filter(
+            UnifiedFact.case_id == case_id,
+            UnifiedFact.fact_type.in_(["hospital_record", "medical_event", "imaging_report"]),
+            UnifiedFact.review_status != FactReviewStatus.EXCLUDED,
+            UnifiedFact.importance != FactImportance.EXCLUDED,
+        )
+        .all()
+    )
+    trusted = [
+        fact
+        for fact in facts
+        if fact.review_status in (FactReviewStatus.CONFIRMED, FactReviewStatus.SYSTEM_VERIFIED)
+    ]
+    return trusted or facts
+
+
 def _candidate_row_to_dict(row: AnalysisCandidate) -> dict[str, Any]:
     return {
         "candidate_db_id": row.id,
@@ -335,114 +374,10 @@ def _build_injury_candidates(
     records: list[HospitalRecord],
     events: list[MedicalEvent],
     imaging: list[ImagingReport],
+    unified_facts: list[UnifiedFact] | None = None,
 ) -> list[dict[str, Any]]:
-    corpus = _build_evidence_corpus(records, events, imaging)
-    candidates: list[dict[str, Any]] = []
-
-    hip_evidence = _match_evidence(
-        corpus,
-        include=("髋关节置换", "全髋关节置换", "半髋关节置换", "人工关节", "股骨头置换", "股骨颈骨折"),
-        require_any=("置换", "人工关节", "股骨颈"),
-    )
-    if hip_evidence:
-        replacement_hit = any(any(term in ev["text"] for term in ("髋关节置换", "人工关节", "股骨头置换", "全髋")) for ev in hip_evidence)
-        decision = "met" if replacement_hit else "uncertain"
-        candidates.append(
-            _candidate(
-                db,
-                candidate_id="hip_joint_replacement",
-                title="左髋关节置换术后",
-                category="伤残等级",
-                decision=decision,
-                confidence=92 if decision == "met" else 70,
-                grade="九级" if decision == "met" else "需核对是否已行关节假体置换",
-                suggestion="可按九级伤残候选处理" if decision == "met" else "需核对手术方式和术后影像",
-                reason="病历/手术或术后检查材料提示股骨颈骨折并行髋关节置换，属于四肢大关节假体置换术后。" if decision == "met" else "材料提示髋部重大损伤，但尚需确认是否为关节假体置换术后。",
-                evidence=hip_evidence,
-                clause_keys=("disability_hip_joint_replacement_9",),
-                must_mention=("髋关节置换", "人工关节", "股骨颈骨折"),
-            )
-        )
-
-    rib_evidence = _match_evidence(corpus, include=("肋骨骨折", "肋骨陈旧性骨折", "肋骨骨痂", "肋骨畸形愈合"))
-    if rib_evidence:
-        max_count = _max_rib_count(" ".join(ev["text"] for ev in rib_evidence))
-        decision = "met" if max_count >= 6 else "uncertain"
-        candidates.append(
-            _candidate(
-                db,
-                candidate_id="rib_fractures",
-                title="多发肋骨骨折",
-                category="伤残等级",
-                decision=decision,
-                confidence=88 if decision == "met" else 62,
-                grade="十级" if decision == "met" else "需核对肋骨根数及是否畸形愈合",
-                suggestion=f"已识别肋骨骨折约{max_count}根，可按十级候选处理" if decision == "met" else f"已识别肋骨骨折约{max_count or '不明'}根，需人工核对",
-                reason="检查事实提示6根以上肋骨骨折，符合十级候选方向。" if decision == "met" else "检查事实提示肋骨骨折，但数量或畸形愈合条件尚不足以直接定级。",
-                evidence=rib_evidence,
-                clause_keys=("disability_rib_fractures_6_10",),
-                must_mention=("肋骨骨折",),
-            )
-        )
-
-    abdominal_evidence = _match_evidence(corpus, include=("肠系膜", "腹腔探查", "结肠浆膜", "肠修补", "脾破裂", "脾脏"))
-    if abdominal_evidence:
-        candidates.append(
-            _candidate(
-                db,
-                candidate_id="abdominal_injury",
-                title="腹部探查及肠系膜/肠壁损伤",
-                category="伤残等级",
-                decision="uncertain",
-                confidence=58,
-                grade="需人工核对",
-                suggestion="仅作为分析时需核对的损伤事实，不自动定级",
-                reason="病历提示腹部探查及肠系膜或肠壁相关处理，但现阶段缺少稳定的结构化条款映射，且需区分疑似脾破裂与术中实际发现。",
-                evidence=abdominal_evidence,
-                clause_keys=(),
-                must_mention=("肠系膜", "腹腔探查"),
-            )
-        )
-
-    dental_evidence = _match_evidence(corpus, include=("牙缺失", "牙齿缺失", "牙槽骨", "下颌骨", "上颌骨", "口腔"))
-    if dental_evidence:
-        candidates.append(
-            _candidate(
-                db,
-                candidate_id="dental_maxillofacial_injury",
-                title="口腔颌面部/牙齿损伤",
-                category="伤残等级",
-                decision="uncertain",
-                confidence=55,
-                grade="需人工核对",
-                suggestion="需核对缺牙数量、牙槽骨损伤范围和临床检查",
-                reason="材料存在牙齿或颌面部损伤线索，但伤残条款通常依赖缺牙数量、牙槽骨损伤范围或功能影响，需人工确认。",
-                evidence=dental_evidence,
-                clause_keys=(),
-                must_mention=("牙", "颌"),
-            )
-        )
-
-    dvt_evidence = _match_evidence(corpus, include=("深静脉血栓", "静脉血栓", "血栓形成"))
-    if dvt_evidence:
-        candidates.append(
-            _candidate(
-                db,
-                candidate_id="dvt_relatedness",
-                title="下肢深静脉血栓",
-                category="因果关系/辅助事实",
-                decision="uncertain",
-                confidence=45,
-                grade="不自动作为伤残结论",
-                suggestion="需结合外伤、制动、既往疾病及临床因果关系判断",
-                reason="血栓可能与创伤后制动、基础疾病或治疗过程有关，不能仅凭检查报告直接认定为委托事项中的伤残依据。",
-                evidence=dvt_evidence,
-                clause_keys=(),
-                must_mention=("血栓",),
-            )
-        )
-
-    return candidates
+    corpus = _build_evidence_corpus(records, events, imaging, unified_facts)
+    return _build_candidates_from_specs(db, corpus, INJURY_CANDIDATE_SPECS)
 
 
 def _build_period_candidates(
@@ -451,31 +386,170 @@ def _build_period_candidates(
     events: list[MedicalEvent],
     imaging: list[ImagingReport],
     entrustment: str,
+    unified_facts: list[UnifiedFact] | None = None,
 ) -> list[dict[str, Any]]:
     if not any(term in entrustment for term in ("误工", "护理", "营养", "三期")):
         return []
 
-    corpus = _build_evidence_corpus(records, events, imaging)
-    femoral_evidence = _match_evidence(corpus, include=("股骨颈骨折", "髋关节置换", "人工关节", "股骨头置换"))
+    corpus = _build_evidence_corpus(records, events, imaging, unified_facts)
+    return _build_candidates_from_specs(db, corpus, PERIOD_CANDIDATE_SPECS, category="三期")
+
+
+def _build_candidates_from_specs(
+    db: Session,
+    corpus: list[dict[str, Any]],
+    specs: tuple[dict[str, Any], ...],
+    *,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    if femoral_evidence:
-        candidates.append(
-            _candidate(
-                db,
-                candidate_id="period_femoral_neck_fracture_surgery",
-                title="股骨颈骨折手术治疗的误工期、护理期、营养期",
-                category="三期",
-                decision="met",
-                confidence=86,
-                grade="三期范围",
-                suggestion="误工期180-365日；护理期90-150日；营养期90-180日，并结合多发损伤综合评定",
-                reason="材料提示股骨颈骨折并经手术治疗，可作为三期评定的主要损伤之一。",
-                evidence=femoral_evidence,
-                clause_keys=("period_femoral_neck_fracture_surgery", "period_multiple_injuries", "period_upper_limit"),
-                must_mention=("误工", "护理", "营养"),
-            )
+    for spec in specs:
+        evidence = _match_evidence(
+            corpus,
+            include=tuple(spec.get("include") or ()),
+            require_any=tuple(spec.get("require_any") or ()),
         )
+        if spec.get("rule") == "pelvis_deformity":
+            evidence = [ev for ev in evidence if _has_positive_pelvis_injury(ev.get("text") or "")]
+        if not evidence:
+            continue
+        candidate = _candidate_from_spec(db, spec, evidence, category=category)
+        if candidate:
+            candidates.append(candidate)
     return candidates
+
+
+def _candidate_from_spec(
+    db: Session,
+    spec: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    *,
+    category: str | None = None,
+) -> dict[str, Any] | None:
+    combined = " ".join(ev.get("text") or "" for ev in evidence)
+    rule = spec.get("rule")
+    candidate_id = spec["id"]
+    title = spec["title"]
+    candidate_category = category or spec.get("category") or ""
+    decision = "uncertain"
+    confidence = int(spec.get("confidence") or spec.get("uncertain_confidence") or 60)
+    grade = spec.get("grade") or spec.get("uncertain_grade") or "需人工核对"
+    suggestion = spec.get("suggestion") or spec.get("uncertain_suggestion") or "需人工核对"
+    reason = spec.get("reason") or spec.get("uncertain_reason") or "材料中存在相关事实，但仍需结合条款成立条件人工核对。"
+    clause_keys = tuple(spec.get("clause_keys") or ())
+
+    if rule == "rib_count":
+        max_count = _max_rib_count(combined)
+        decision = "met" if max_count >= 6 else "uncertain"
+        confidence = 88 if decision == "met" else 62
+        grade = "十级" if decision == "met" else "需核对肋骨根数及是否畸形愈合"
+        suggestion = (
+            f"已识别肋骨骨折约{max_count}根，可按十级候选处理"
+            if decision == "met"
+            else f"已识别肋骨骨折约{max_count or '不明'}根，需人工核对"
+        )
+        reason = (
+            "检查事实提示6根以上肋骨骨折，符合十级候选方向。"
+            if decision == "met"
+            else "检查事实提示肋骨骨折，但数量或畸形愈合条件尚不足以直接定级。"
+        )
+    elif rule == "pelvis_deformity":
+        deformity_hit = any(term in combined for term in ("畸形愈合", "骨盆环不稳定", "骶髂关节分离", "闭孔形态不对称", "骨盆形态异常"))
+        decision = "met" if deformity_hit else "uncertain"
+        confidence = 84 if decision == "met" else 68
+        grade = "十级" if decision == "met" else "需核对是否畸形愈合"
+        suggestion = "可按十级候选处理" if decision == "met" else "需核对骨盆骨折是否形成畸形愈合或骨盆形态异常。"
+        reason = (
+            "材料提示骨盆两处以上骨折并存在畸形愈合或骨盆形态异常线索，符合十级候选方向。"
+            if decision == "met"
+            else "材料提示骨盆多发骨折，但目前证据多为骨折、骨痂或对位情况，尚不足以直接等同于畸形愈合。"
+        )
+    elif rule == "always_uncertain":
+        decision = "uncertain"
+        confidence_any = tuple(spec.get("confidence_any") or ())
+        if confidence_any:
+            confidence = int(spec.get("high_confidence") if any(term in combined for term in confidence_any) else spec.get("low_confidence"))
+    elif rule == "brain_softening":
+        has_softening = "脑软化灶" in combined or "软化灶" in combined
+        has_neuro_sign = _has_neurologic_symptom_or_sign(combined)
+        decision = "met" if has_softening and has_neuro_sign else "uncertain"
+        confidence = 84 if decision == "met" else 62
+        grade = "十级" if decision == "met" else "需核对是否伴神经系统症状或者体征"
+        suggestion = "可按十级伤残候选处理" if decision == "met" else "需核对脑软化灶与神经系统症状/体征是否同时存在。"
+        reason = (
+            "材料提示颅脑损伤后遗脑软化灶，并有神经系统症状或体征线索，符合十级候选方向。"
+            if decision == "met"
+            else "材料提示颅脑损伤后遗改变，但尚未同时稳定确认脑软化灶及神经系统症状/体征。"
+        )
+    elif rule == "abdominal_repair":
+        repair_evidence = [ev for ev in evidence if _has_abdominal_organ_repair(ev.get("text") or "")]
+        if not repair_evidence:
+            return None
+        evidence = repair_evidence
+        combined = " ".join(ev.get("text") or "" for ev in evidence)
+        decision = "met"
+        confidence = 82
+        grade = "十级"
+        suggestion = "可按十级伤残候选处理，仍需核对手术记录中修补的具体脏器。"
+        reason = "材料提示肝、脾、胰腺、胃、肠、胆道或膈肌修补术后，符合腹部损伤十级候选方向。"
+    elif rule == "dental_count":
+        tooth_count = _max_tooth_loss_or_fracture_count(combined)
+        alveolar_combo = _has_alveolar_tooth_loss_combo(combined, tooth_count)
+        decision = "met" if tooth_count >= 7 or alveolar_combo else "uncertain"
+        confidence = 82 if decision == "met" else 55
+        grade = "十级" if decision == "met" else "需核对缺牙/折牙数量及牙槽骨缺损"
+        suggestion = (
+            "可按十级伤残候选处理"
+            if decision == "met"
+            else "需核对牙齿缺失或折断枚数、牙槽骨缺损范围和临床检查。"
+        )
+        reason = (
+            "材料提示牙齿缺失或折断数量达到7枚以上，或牙槽骨部分缺损合并牙齿缺失/折断4枚以上，符合十级候选方向。"
+            if decision == "met"
+            else "材料存在牙齿或颌面损伤线索，但当前事实未稳定显示达到缺牙/折牙数量或牙槽骨缺损条件。"
+        )
+    elif rule == "tib_fib_period":
+        open_fracture = "开放" in combined
+        candidate_id = "period_tib_fib_open_fracture" if open_fracture else "period_tib_fib_fracture"
+        decision = "met"
+        confidence = 84 if open_fracture else 78
+        grade = "三期范围"
+        suggestion = (
+            "开放性骨折：误工期150-180日；护理期60-90日；营养期60-90日，并结合多发损伤综合评定"
+            if open_fracture
+            else "胫腓骨骨折：误工期120-180日；护理期30-90日；营养期60-90日，并结合多发损伤综合评定"
+        )
+        reason = "材料提示胫腓骨骨折，可作为三期评定的重要损伤之一；如为开放性骨折，应优先采用开放性骨折区间。"
+        clause_keys = ("period_tib_fib_open_fracture",) if open_fracture else ("period_multiple_injuries", "period_upper_limit")
+    elif spec.get("met_any"):
+        decision = "met" if any(term in combined for term in tuple(spec.get("met_any") or ())) else "uncertain"
+        confidence = int(spec.get("met_confidence") if decision == "met" else spec.get("uncertain_confidence"))
+        grade = spec.get("met_grade") if decision == "met" else spec.get("uncertain_grade")
+        suggestion = spec.get("met_suggestion") if decision == "met" else spec.get("uncertain_suggestion")
+        reason = spec.get("met_reason") if decision == "met" else spec.get("uncertain_reason")
+    else:
+        decision = "met"
+        confidence = int(spec.get("confidence") or 80)
+        grade = spec.get("grade") or "三期范围"
+
+    must_mention = tuple(spec.get("must_mention") or ())
+    if not must_mention and candidate_category == "三期":
+        must_mention = ("误工", "护理", "营养")
+
+    return _candidate(
+        db,
+        candidate_id=candidate_id,
+        title=title,
+        category=candidate_category,
+        decision=decision,
+        confidence=confidence,
+        grade=grade,
+        suggestion=suggestion,
+        reason=reason,
+        evidence=evidence,
+        clause_keys=clause_keys,
+        must_mention=must_mention,
+    )
 
 
 def _candidate(
@@ -513,7 +587,7 @@ def _candidate_warnings(decision: str, evidence: list[dict[str, Any]]) -> list[s
     warnings: list[str] = []
     if decision == "uncertain":
         warnings.append("该候选证据不足或条款映射未稳定，不能直接写成正式结论。")
-    if any(ev.get("review_status") not in (FactReviewStatus.CONFIRMED, None, "") for ev in evidence):
+    if any(ev.get("review_status") not in (FactReviewStatus.CONFIRMED, FactReviewStatus.SYSTEM_VERIFIED, None, "") for ev in evidence):
         warnings.append("部分来源事实尚未人工确认。")
     if not any(ev.get("source_pages") for ev in evidence):
         warnings.append("部分来源缺少页码，建议回到原图核对。")
@@ -534,6 +608,7 @@ def _standard_from_clause(db: Session, clause_key: str) -> dict[str, Any]:
             "snippet": clause.get("clause_label", ""),
             "score": 0,
         }
+    ref = _normalize_catalog_reference(ref, clause)
     ref.update(
         {
             "clause_key": clause_key,
@@ -544,6 +619,34 @@ def _standard_from_clause(db: Session, clause_key: str) -> dict[str, Any]:
         }
     )
     return ref
+
+
+def _normalize_catalog_reference(ref: dict[str, Any], clause: dict[str, Any]) -> dict[str, Any]:
+    """Known catalog clauses should display the known clause, not the broad chunk title.
+
+    OCR/markdown chunks may contain several clauses. A chunk headed "全身冻伤"
+    can still contain Appendix A.4 later in the text, so using the chunk header
+    as the citation title leaks unrelated standards into the UI and prompt.
+    """
+    clause_label = (clause.get("clause_label") or "").strip()
+    if not clause_label:
+        return ref
+
+    normalized = dict(ref)
+    code, title = _split_clause_label(clause_label)
+    normalized["section_code"] = code
+    normalized["section_title"] = title or clause_label
+    normalized["text"] = clause_label
+    normalized["snippet"] = clause_label
+    return normalized
+
+
+def _split_clause_label(label: str) -> tuple[str | None, str]:
+    match = re.match(r"^((?:附录\s*)?[A-ZＡ-Ｚ]?\d+(?:\.\d+)+|附录\s*[A-ZＡ-Ｚ]\.\d+)\s*(.*)$", label)
+    if not match:
+        return None, label
+    code = re.sub(r"\s+", "", match.group(1))
+    return code, match.group(2).strip() or label
 
 
 def _find_standard_reference(db: Session, clause: dict[str, Any]) -> dict[str, Any] | None:
@@ -570,7 +673,11 @@ def _build_evidence_corpus(
     records: list[HospitalRecord],
     events: list[MedicalEvent],
     imaging: list[ImagingReport],
+    unified_facts: list[UnifiedFact] | None = None,
 ) -> list[dict[str, Any]]:
+    if unified_facts:
+        return _build_unified_evidence_corpus(unified_facts)
+
     rows: list[dict[str, Any]] = []
     for record in records:
         text = _join_text(
@@ -653,6 +760,38 @@ def _build_evidence_corpus(
     return rows
 
 
+def _build_unified_evidence_corpus(facts: list[UnifiedFact]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for fact in facts:
+        text = _join_text(
+            fact.hospital_name,
+            fact.fact_date,
+            fact.fact_type,
+            fact.fact_role,
+            fact.title,
+            fact.summary,
+            fact.source_quote,
+        )
+        rows.append(
+            {
+                "kind": fact.source_kind or fact.fact_type,
+                "id": fact.source_id or fact.id,
+                "date": fact.fact_date or "",
+                "hospital_name": fact.hospital_name or "",
+                "title": fact.title or fact.fact_role or fact.fact_type or "事实",
+                "summary": _clip(fact.summary or fact.source_quote or text, 260),
+                "quote": _clip(fact.source_quote or fact.summary or text, 180),
+                "text": text,
+                "source_pages": _json_list(fact.source_page_numbers),
+                "source_material_ids": _json_list(fact.source_material_ids),
+                "review_status": fact.review_status,
+                "importance": fact.importance,
+                "unified_fact_id": fact.id,
+            }
+        )
+    return rows
+
+
 def _match_evidence(
     corpus: list[dict[str, Any]],
     *,
@@ -685,6 +824,8 @@ def _evidence_score(row: dict[str, Any], terms: tuple[str, ...]) -> int:
         score += 4
     if row.get("review_status") == FactReviewStatus.CONFIRMED:
         score += 3
+    elif row.get("review_status") == FactReviewStatus.SYSTEM_VERIFIED:
+        score += 2
     if any(term in text for term in ("全髋关节置换", "髋关节置换", "人工关节", "股骨头置换")):
         score += 14
     if _max_rib_count(text) >= 6:
@@ -712,6 +853,114 @@ def _max_rib_count(text: str) -> int:
     return max_count
 
 
+def _has_positive_pelvis_injury(text: str) -> bool:
+    """Avoid treating a pelvis scan title or normal pelvis description as injury evidence."""
+    if not text:
+        return False
+    normalized = re.sub(r"\s+", "", text)
+    patterns = (
+        r"骨盆[^。；;，,]{0,16}(?:多发)?骨折",
+        r"耻骨[^。；;，,]{0,16}骨折",
+        r"坐骨[^。；;，,]{0,16}骨折",
+        r"骶骨[^。；;，,]{0,16}骨折",
+        r"髋臼[^。；;，,]{0,16}骨折",
+        r"骶髂关节[^。；;，,]{0,16}(?:分离|骨折)",
+    )
+    negative_terms = ("未见", "无明显", "未明确", "尚可", "正常")
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            window = normalized[max(0, match.start() - 12): match.end() + 12]
+            if any(term in window for term in negative_terms):
+                continue
+            return True
+    return False
+
+
+def _has_neurologic_symptom_or_sign(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "")
+    if not normalized:
+        return False
+    positive_terms = (
+        "神经系统症状",
+        "神经系统体征",
+        "肌力",
+        "偏瘫",
+        "截瘫",
+        "肢体麻木",
+        "感觉障碍",
+        "运动障碍",
+        "病理反射",
+        "腱反射",
+        "失语",
+        "癫痫",
+        "头痛",
+        "头晕",
+        "记忆力",
+        "认知",
+    )
+    negative_windows = ("未见神经系统", "无神经系统", "神经系统未见", "肌力正常", "病理反射未引出")
+    if any(term in normalized for term in negative_windows):
+        return False
+    return any(term in normalized for term in positive_terms)
+
+
+def _has_abdominal_organ_repair(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "")
+    if not normalized or "修补" not in normalized:
+        return False
+    # 肠系膜修补本身不是“胃、肠或者胆道修补术后”，不能据此直接定级。
+    if "肠系膜修补" in normalized and not any(term in normalized for term in ("肠壁修补", "小肠修补", "结肠修补", "胃修补", "胆道修补")):
+        return False
+    direct_terms = (
+        "肝修补",
+        "肝破裂修补",
+        "脾修补",
+        "脾破裂修补",
+        "胰腺修补",
+        "胃修补",
+        "胃破裂修补",
+        "小肠修补",
+        "小肠破裂修补",
+        "结肠修补",
+        "结肠破裂修补",
+        "肠壁修补",
+        "肠破裂修补",
+        "胆道修补",
+        "胆管修补",
+        "膈肌修补",
+    )
+    if any(term in normalized for term in direct_terms):
+        return True
+    return bool(re.search(r"(肝|脾|胰腺|胃|小肠|结肠|肠壁|胆道|胆管|膈肌)[^。；;，,]{0,12}修补", normalized))
+
+
+def _max_tooth_loss_or_fracture_count(text: str) -> int:
+    normalized = re.sub(r"\s+", "", text or "")
+    if not normalized:
+        return 0
+    max_count = 0
+    patterns = (
+        r"(?:牙齿|牙|恒牙|乳牙)?(?:缺失|脱落|折断|折裂|缺损)[^。；;，,]{0,8}(\d{1,2})\s*(?:枚|颗|个|只)",
+        r"(\d{1,2})\s*(?:枚|颗|个|只)(?:牙齿|牙)?(?:缺失|脱落|折断|折裂|缺损)",
+        r"缺牙[^。；;，,]{0,8}(\d{1,2})\s*(?:枚|颗|个|只)",
+        r"折牙[^。；;，,]{0,8}(\d{1,2})\s*(?:枚|颗|个|只)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            max_count = max(max_count, int(match.group(1)))
+    return max_count
+
+
+def _has_alveolar_tooth_loss_combo(text: str, tooth_count: int | None = None) -> bool:
+    normalized = re.sub(r"\s+", "", text or "")
+    if "牙槽骨" not in normalized:
+        return False
+    count = tooth_count if tooth_count is not None else _max_tooth_loss_or_fracture_count(normalized)
+    if count >= 4:
+        return True
+    return bool(re.search(r"牙槽骨[^。；;，,]{0,16}(?:缺损|骨折|吸收)[^。；;，,]{0,20}(?:牙齿|牙)[^。；;，,]{0,10}(?:缺失|脱落|折断|折裂)", normalized))
+
+
 def _collect_standard_references(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     refs: list[dict[str, Any]] = []
@@ -734,17 +983,28 @@ def _build_warnings(
     events: list[MedicalEvent],
     imaging: list[ImagingReport],
     candidates: list[dict[str, Any]],
+    unified_facts: list[UnifiedFact] | None = None,
 ) -> list[str]:
     warnings: list[str] = []
     if not case.entrustment_matter:
         warnings.append("委托事项为空，分析说明无法判断哪些损伤应进入正式结论。")
-    if not events:
+    if unified_facts:
+        if not any(fact.fact_type == "medical_event" for fact in unified_facts):
+            warnings.append("统一事实库中缺少病历事件型事实，建议先建立或确认病历事实。")
+        if not any(fact.fact_type == "imaging_report" for fact in unified_facts):
+            warnings.append("统一事实库中缺少检查事实，影像依据不足。")
+    elif not events:
         warnings.append("尚无病历事件型事实，分析说明只能依赖病历汇总字段，来源页精度会降低。")
-    if not imaging:
+    if not unified_facts and not imaging:
         warnings.append("尚无检查事实，影像依据不足。")
     if not any(item.get("decision") == "met" for item in candidates):
         warnings.append("未形成 decision=met 的伤残候选，正式伤残结论需人工核对。")
-    unreviewed = sum(1 for item in candidates for ev in item.get("evidence") or [] if ev.get("review_status") == FactReviewStatus.PENDING)
+    unreviewed = sum(
+        1
+        for item in candidates
+        for ev in item.get("evidence") or []
+        if ev.get("review_status") == FactReviewStatus.PENDING
+    )
     if unreviewed:
         warnings.append(f"有 {unreviewed} 条候选来源事实尚未人工确认。")
     return warnings

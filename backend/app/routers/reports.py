@@ -26,6 +26,7 @@ def get_report(case_id: int, db: Session = Depends(get_db)):
 @router.post("", response_model=ReportResponse)
 def create_report(data: ReportCreate, db: Session = Depends(get_db)):
     """创建报告"""
+    import json as _json
     case = db.query(Case).filter(Case.id == data.case_id).first()
     if not case:
         raise HTTPException(status_code=404, detail="案件不存在")
@@ -35,6 +36,12 @@ def create_report(data: ReportCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="该案件已有报告")
 
     report = Report(**data.model_dump())
+    report_editable_fields = {"case_facts", "material_summary", "appraisal_process", "analysis", "opinion"}
+    confirmed = [
+        key for key, value in data.model_dump(exclude_unset=True).items()
+        if key in report_editable_fields and value
+    ]
+    report.confirmed_fields = _json.dumps(confirmed, ensure_ascii=False)
     db.add(report)
     db.commit()
     db.refresh(report)

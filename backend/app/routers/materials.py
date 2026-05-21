@@ -22,7 +22,10 @@ from app.models.case import (
     Material,
     MaterialGroup,
     MaterialType,
+    MedicalEvent,
     OcrStatus,
+    Report,
+    UnifiedFact,
 )
 from app.schemas.case import (
     MaterialResponse, MaterialGroupResponse, MaterialGroupCreate, MaterialGroupUpdate
@@ -461,8 +464,9 @@ def _ensure_pdf_page_analysis(
     page_path = page["filepath"]
     cached = _load_pdf_page_analysis(page_path)
     cache_is_fresh = cached and cached.get("classifier_version") == CLASSIFIER_VERSION
+    cache_has_ocr_text = bool(cached and (cached.get("ocr_text") or "").strip())
 
-    if cache_is_fresh and not force:
+    if cache_is_fresh and cache_has_ocr_text and not force:
         prediction = dict(cached.get("prediction") or {})
         if prediction.get("material_type") in [MaterialType.MEDICAL_RECORD, MaterialType.IMAGING_REPORT]:
             canonical_name, matched_confirmed = _canonicalize_group_name(case_id, prediction.get("group_name"), db)
@@ -704,6 +708,93 @@ def _apply_hospital_name_to_material(material: Material, aliases: set[str], cano
     _save_pdf_page_analysis(material.file_path, analysis)
 
 
+def _collect_hospital_aliases(case_id: int, canonical_name: str, aliases: set[str], db: Session) -> set[str]:
+    """收集同一标准医院名下已经记录过的 OCR 错名，供一次性后台修正。"""
+    result = {name.strip() for name in aliases if name and name.strip()}
+    if canonical_name:
+        result.add(canonical_name)
+    stored_aliases = db.query(HospitalNameAlias).filter(
+        HospitalNameAlias.case_id == case_id,
+        HospitalNameAlias.canonical_name == canonical_name,
+    ).all()
+    for alias in stored_aliases:
+        if alias.alias_name:
+            result.add(alias.alias_name)
+        if alias.canonical_name:
+            result.add(alias.canonical_name)
+    return result
+
+
+def _hospital_name_matches_alias(name: Optional[str], aliases: set[str], canonical_name: str) -> bool:
+    name = (name or "").strip()
+    if not name:
+        return False
+    if name in aliases or name == canonical_name:
+        return True
+    return _hospital_name_similarity(name, canonical_name) >= 0.82
+
+
+def _sync_group_records_to_hospital(
+    *,
+    case_id: int,
+    target: MaterialGroup,
+    aliases: set[str],
+    canonical_name: str,
+    db: Session,
+) -> None:
+    """把材料分组、结构化记录、事实库和已生成报告统一到确认后的医院名。"""
+    target_materials = db.query(Material).filter(Material.group_id == target.id).all()
+    target_material_ids = [material.id for material in target_materials]
+
+    for material in target_materials:
+        _apply_hospital_name_to_material(material, aliases, canonical_name)
+
+    if target.material_type == MaterialType.MEDICAL_RECORD:
+        record_query = db.query(HospitalRecord).filter(HospitalRecord.case_id == case_id)
+        if target_material_ids:
+            record_query = record_query.filter(
+                (HospitalRecord.group_id == target.id) | (HospitalRecord.material_id.in_(target_material_ids))
+            )
+        else:
+            record_query = record_query.filter(HospitalRecord.group_id == target.id)
+        for record in record_query.all():
+            record.group_id = target.id
+            record.hospital_name = canonical_name
+
+        for event in db.query(MedicalEvent).filter(
+            MedicalEvent.case_id == case_id,
+            MedicalEvent.group_id == target.id,
+        ).all():
+            event.hospital_name = canonical_name
+
+    if target.material_type == MaterialType.IMAGING_REPORT:
+        report_query = db.query(ImagingReport).filter(ImagingReport.case_id == case_id)
+        if target_material_ids:
+            report_query = report_query.filter(
+                (ImagingReport.group_id == target.id) | (ImagingReport.material_id.in_(target_material_ids))
+            )
+        else:
+            report_query = report_query.filter(ImagingReport.group_id == target.id)
+        for report in report_query.all():
+            report.group_id = target.id
+            report.hospital_name = canonical_name
+
+    for model in (HospitalRecord, ImagingReport, MedicalEvent, UnifiedFact):
+        for row in db.query(model).filter(model.case_id == case_id).all():
+            if _hospital_name_matches_alias(getattr(row, "hospital_name", None), aliases, canonical_name):
+                row.hospital_name = canonical_name
+
+    for fact in db.query(UnifiedFact).filter(UnifiedFact.case_id == case_id).all():
+        fact.title = _replace_aliases_in_text(fact.title, aliases, canonical_name)
+        fact.summary = _replace_aliases_in_text(fact.summary, aliases, canonical_name)
+        fact.source_quote = _replace_aliases_in_text(fact.source_quote, aliases, canonical_name)
+
+    report = db.query(Report).filter(Report.case_id == case_id).first()
+    if report:
+        for field in ("case_facts", "material_summary", "appraisal_process", "analysis", "opinion"):
+            setattr(report, field, _replace_aliases_in_text(getattr(report, field), aliases, canonical_name))
+
+
 def _renumber_group_materials(group_id: int, db: Session) -> None:
     materials = db.query(Material).filter(Material.group_id == group_id).all()
     materials = sorted(materials, key=material_sequence_key)
@@ -896,9 +987,11 @@ def confirm_hospital_group_name(
             if not candidate.is_confirmed and _hospital_name_similarity(candidate.group_name, canonical_name) >= 0.82:
                 candidate_groups.append(candidate)
 
+    source_group_ids: set[int] = set()
     for source_group in candidate_groups:
         aliases.add(source_group.group_name)
         _upsert_hospital_alias(case_id, source_group.group_name, canonical_name, db)
+        source_group_ids.add(source_group.id)
         if source_group.id == target.id:
             continue
         for material in list(source_group.materials):
@@ -913,6 +1006,21 @@ def confirm_hospital_group_name(
 
     target.group_name = canonical_name
     target.is_confirmed = True
+    aliases = _collect_hospital_aliases(case_id, canonical_name, aliases, db)
+    for source_group_id in source_group_ids:
+        if source_group_id == target.id:
+            continue
+        if target.material_type == MaterialType.MEDICAL_RECORD:
+            db.query(MedicalEvent).filter(MedicalEvent.group_id == source_group_id).update({
+                "group_id": target.id,
+                "hospital_name": canonical_name,
+            }, synchronize_session=False)
+        if target.material_type == MaterialType.IMAGING_REPORT:
+            db.query(ImagingReport).filter(ImagingReport.group_id == source_group_id).update({
+                "group_id": target.id,
+                "hospital_name": canonical_name,
+            }, synchronize_session=False)
+
     for material in db.query(Material).filter(Material.group_id == target.id).all():
         _apply_hospital_name_to_material(material, aliases, canonical_name)
 
@@ -924,6 +1032,21 @@ def confirm_hospital_group_name(
         ImagingReport.case_id == case_id,
         ImagingReport.hospital_name.in_(list(aliases)),
     ).update({"hospital_name": canonical_name}, synchronize_session=False)
+    db.query(MedicalEvent).filter(
+        MedicalEvent.case_id == case_id,
+        MedicalEvent.hospital_name.in_(list(aliases)),
+    ).update({"hospital_name": canonical_name}, synchronize_session=False)
+    db.query(UnifiedFact).filter(
+        UnifiedFact.case_id == case_id,
+        UnifiedFact.hospital_name.in_(list(aliases)),
+    ).update({"hospital_name": canonical_name}, synchronize_session=False)
+    _sync_group_records_to_hospital(
+        case_id=case_id,
+        target=target,
+        aliases=aliases,
+        canonical_name=canonical_name,
+        db=db,
+    )
     _renumber_group_materials(target.id, db)
     db.commit()
     db.refresh(target)

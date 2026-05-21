@@ -766,20 +766,84 @@
               </el-form>
             </el-tab-pane>
 
+            <!-- 子Tab 3: 统一事实库 -->
+            <el-tab-pane name="factLibrary">
+              <template #label>
+                <span>事实库</span>
+              </template>
+              <div class="fact-library-panel">
+                <div class="fact-library-toolbar">
+                  <div>
+                    <el-button type="primary" size="small" @click="buildFactLibrary" :loading="buildingFacts" :disabled="isCompleted">
+                      <el-icon><MagicStick /></el-icon> 建立/更新事实库
+                    </el-button>
+                    <el-button size="small" plain @click="syncFactLibrary(false)" :loading="syncingFacts" :disabled="isCompleted || buildingFacts">
+                      <el-icon><Refresh /></el-icon> 刷新已有事实
+                    </el-button>
+                    <span class="fact-library-hint">从病历材料和检查报告生成可核验事实；下游资料摘要、鉴定过程和分析说明均以此为依据</span>
+                  </div>
+	                  <div class="fact-library-counts">
+	                    <el-tag size="small" type="success">已确认 {{ unifiedFactCounts.confirmed || 0 }}</el-tag>
+	                    <el-tag size="small" type="primary">系统预采信 {{ unifiedFactCounts.system_verified || 0 }}</el-tag>
+	                    <el-tag size="small" type="warning">待核验 {{ unifiedFactCounts.pending || 0 }}</el-tag>
+	                    <el-tag size="small" type="danger">已排除 {{ unifiedFactCounts.excluded || 0 }}</el-tag>
+	                    <el-tag size="small" type="primary">核心 {{ unifiedFactCounts.core || 0 }}</el-tag>
+                  </div>
+                </div>
+                <el-table :data="unifiedFacts" border size="small" v-loading="loadingUnifiedFacts" class="fact-library-table">
+                  <el-table-column label="状态" width="86">
+                    <template #default="{ row }">
+                      <el-tag size="small" :type="factStatusType(row)" effect="plain">{{ factStatusLabel(row) }}</el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="重要性" width="86">
+                    <template #default="{ row }">
+                      <el-tag size="small" :type="factImportanceType(row.importance)" effect="plain">{{ factImportanceLabel(row.importance) }}</el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="日期" prop="fact_date" width="130" />
+                  <el-table-column label="事实内容" min-width="420">
+                    <template #default="{ row }">
+                      <div class="unified-fact-title">
+                        {{ factTypeLabel(row.fact_type, row.fact_role) }}：{{ row.title || '未命名事实' }}
+                        <span v-if="row.hospital_name" class="unified-fact-hospital">{{ row.hospital_name }}</span>
+                      </div>
+                      <div class="unified-fact-summary">{{ row.summary || '-' }}</div>
+                      <div v-if="row.source_quote" class="unified-fact-source">依据：{{ row.source_quote }}</div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="来源页" width="140">
+                    <template #default="{ row }">
+                      <div class="unified-fact-pages">{{ unifiedFactSourcePages(row) || '-' }}</div>
+                      <el-button v-if="hasSourceImage(row)" link type="warning" @click="viewFactSourcePages(row, 'unified')">
+                        {{ sourceImageButtonText(row) }}
+                      </el-button>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="230" fixed="right">
+                    <template #default="{ row }">
+                      <el-button link type="success" :disabled="isCompleted || row.review_status === 'confirmed'" @click="updateUnifiedFact(row, { review_status: 'confirmed' })">确认</el-button>
+                      <el-button link type="primary" :disabled="isCompleted || row.importance === 'core'" @click="updateUnifiedFact(row, { importance: 'core' })">核心</el-button>
+                      <el-button link type="info" :disabled="isCompleted || row.importance === 'supporting'" @click="updateUnifiedFact(row, { importance: 'supporting' })">辅助</el-button>
+                      <el-button link type="danger" :disabled="isCompleted || row.review_status === 'excluded'" @click="updateUnifiedFact(row, { review_status: 'excluded', importance: 'excluded' })">排除</el-button>
+                    </template>
+                  </el-table-column>
+                </el-table>
+                <el-empty v-if="!loadingUnifiedFacts && !unifiedFacts.length" description="暂无统一事实，请点击“建立/更新事实库”" />
+              </div>
+            </el-tab-pane>
+
             <!-- 子Tab 3: 资料摘要 -->
             <el-tab-pane name="summary">
               <template #label>
                 <span>资料摘要</span>
               </template>
               <div style="margin-bottom: 12px;" v-if="!isCompleted">
-                <el-button type="primary" size="small" @click="loadMedicalGroups" :loading="loadingMedicalGroups">
-                  <el-icon><MagicStick /></el-icon> 建立病历事实卡
-                </el-button>
                 <el-button type="success" size="small" @click="handleGenerateSummary" :loading="generatingSummary" :disabled="!hospitalRecords.length">
-                  <el-icon><Document /></el-icon> 生成资料摘要
+                  <el-icon><Document /></el-icon> 从事实库生成资料摘要
                 </el-button>
                 <span style="color: #909399; font-size: 12px; margin-left: 8px;">
-                  先按医院分组提取病历事实，确认后再生成资料摘要
+                  请先在事实库页面建立并核验病历事实；本页只负责生成和编辑资料摘要正文
                 </span>
               </div>
 
@@ -939,17 +1003,14 @@
 
               <div class="process-action-bar" v-if="!isCompleted">
                 <div class="process-action-main">
-                  <el-button type="primary" @click="handleExtractImagingReports" :loading="extractingImaging">
-                    <el-icon><MagicStick /></el-icon> 建立检查事实卡
-                  </el-button>
                   <el-button type="primary" plain @click="showAddImagingDialog = true">
                     <el-icon><Plus /></el-icon> 添加检查报告
                   </el-button>
                   <el-button type="success" @click="generateAppraisalProcess" :loading="generatingProcess">
-                    <el-icon><MagicStick /></el-icon> 生成鉴定过程
+                    <el-icon><MagicStick /></el-icon> 从事实库生成鉴定过程
                   </el-button>
                 </div>
-                <span class="process-action-hint">先整理检查事实，再填写法医临床检查，最后生成鉴定过程正文</span>
+                <span class="process-action-hint">请先在事实库页面建立并核验检查依据；本页用于填写法医临床检查并生成正文</span>
               </div>
 
               <!-- 法医临床检查 -->
@@ -972,46 +1033,6 @@
                   </el-form-item>
                 </el-form>
               </el-card>
-
-              <el-divider>检查事实卡</el-divider>
-              <el-alert
-                type="info"
-                :closable="false"
-                show-icon
-                style="margin-bottom: 12px;"
-                title="检查报告按文字提取；真正的CT/X线/MRI片只作为阅片来源页保存，不强行当作OCR报告。"
-              />
-              <div v-if="imagingReports.length" class="imaging-fact-grid">
-                <el-card v-for="row in imagingReports" :key="row.id" shadow="never" class="fact-card imaging-fact-card">
-                  <template #header>
-                    <div class="record-header">
-                      <div>
-                        <div class="fact-title">
-                          {{ row.hospital_name || '未命名医院' }} / {{ row.exam_type || '检查' }} / {{ row.exam_part || '部位未填' }}
-                          <el-tag size="small" :type="factStatusType(row)" effect="plain">{{ factStatusLabel(row) }}</el-tag>
-                        </div>
-                        <div class="fact-meta">
-                          报告日期：{{ row.report_date || '-' }}
-                          <span>片号：{{ row.film_number || '-' }}</span>
-                          <span>数量：{{ row.film_count || 1 }}</span>
-                        </div>
-                      </div>
-                      <div class="record-actions">
-                        <el-button v-if="hasSourceImage(row)" link type="warning" @click="viewFactSourcePages(row, 'imaging')">
-                          {{ sourceImageButtonText(row) }}
-                        </el-button>
-                        <template v-if="!isCompleted">
-                          <el-button link type="success" @click="confirmImagingReport(row)" :disabled="factStatus(row) === 'confirmed'">确认事实</el-button>
-                          <el-button link type="primary" @click="editImagingReport(row)">编辑</el-button>
-                          <el-button link type="danger" @click="deleteImagingReport(row)">删除</el-button>
-                        </template>
-                      </div>
-                    </div>
-                  </template>
-                  <div class="fact-content">{{ row.report_content || '暂无报告内容' }}</div>
-                </el-card>
-              </div>
-              <el-empty v-else description="暂无检查事实卡，请先提取检查报告" />
 
               <!-- 鉴定过程文本 -->
               <el-divider>鉴定过程正文</el-divider>
@@ -1077,7 +1098,7 @@
                 >
                   <div class="analysis-candidate-head">
                     <el-tag size="small" :type="analysisCandidateTag(candidate.decision)">
-                      {{ candidate.decision === 'met' ? '可采信' : candidate.decision === 'uncertain' ? '需核对' : candidate.decision }}
+                      {{ analysisCandidateDecisionLabel(candidate.decision) }}
                     </el-tag>
                     <el-tag size="small" effect="plain" :type="analysisCandidateStatusTag(candidate.status)">
                       {{ analysisCandidateStatusLabel(candidate.status) }}
@@ -1189,23 +1210,14 @@
         <el-card shadow="never" class="precheck-card">
           <template #header>
             <div class="record-header">
-              <span style="font-weight: 600;">生成前检查</span>
-              <div style="display: flex; gap: 8px; align-items: center;">
-                <el-tag :type="hardPrecheckWarnings.length ? 'warning' : 'success'" effect="plain">
-                  {{ hardPrecheckWarnings.length ? `${hardPrecheckWarnings.length} 项需注意` : '可以生成' }}
-                </el-tag>
-                <el-button
-                  v-if="!isCompleted"
-                  type="success"
-                  size="small"
-                  @click="generateFullReport"
-                  :loading="generatingFullReport"
-                >
-                  <el-icon><MagicStick /></el-icon> 一键生成完整报告
-                </el-button>
-              </div>
-            </div>
-          </template>
+	              <span style="font-weight: 600;">生成前检查</span>
+	              <div style="display: flex; gap: 8px; align-items: center;">
+	                <el-tag :type="hardPrecheckWarnings.length ? 'warning' : 'success'" effect="plain">
+	                  {{ hardPrecheckWarnings.length ? `${hardPrecheckWarnings.length} 项需注意` : '可以生成' }}
+	                </el-tag>
+	              </div>
+	            </div>
+	          </template>
           <div class="precheck-grid">
             <div v-for="item in reportGenerationChecks" :key="item.label" class="precheck-item">
               <el-icon :color="item.ok ? '#67c23a' : (item.soft ? '#e6a23c' : '#f56c6c')">
@@ -1930,6 +1942,11 @@ const personData = ref({ name: '', gender: '', birth_date: '', id_number: '', ad
 const hospitalRecords = ref([])
 const medicalEvents = ref([])
 const imagingReports = ref([])
+const unifiedFacts = ref([])
+const unifiedFactCounts = ref({})
+const loadingUnifiedFacts = ref(false)
+const buildingFacts = ref(false)
+const syncingFacts = ref(false)
 const reportData = ref({ case_facts: '', material_summary: '', appraisal_process: '', analysis: '', opinion: '', opinion_confirmed: false })
 
 // 材料管理
@@ -1955,7 +1972,6 @@ const extractingMedical = ref(false)
 const generatingSummary = ref(false)
 const extractingImaging = ref(false)
 const generatingProcess = ref(false)
-const generatingFullReport = ref(false)
 const extractingAnalysis = ref(false)
 const extractingOpinion = ref(false)
 const generatingWord = ref(false)
@@ -1965,12 +1981,17 @@ const loadingAnalysisHarness = ref(false)
 const standardReferences = ref([])
 const analysisCandidates = ref([])
 const analysisCandidateWarnings = ref([])
-const analysisHarnessCandidates = computed(() => analysisCandidates.value || [])
+const visibleAnalysisCandidates = (rows) => (rows || []).filter(item => item.status !== 'excluded')
+const analysisHarnessCandidates = computed(() => visibleAnalysisCandidates(analysisCandidates.value))
 const analysisHarnessWarnings = computed(() => analysisCandidateWarnings.value || [])
 const analysisCandidateTag = (decision) => {
   if (decision === 'met') return 'success'
   if (decision === 'uncertain') return 'warning'
   return 'info'
+}
+const analysisCandidateDecisionLabel = (decision) => {
+  const map = { met: '可采信', uncertain: '需核对', not_met: '不支持' }
+  return map[decision] || decision || '未判定'
 }
 const analysisCandidateStatusTag = (status) => {
   const map = { accepted: 'success', excluded: 'danger', needs_review: 'warning', pending: 'info' }
@@ -3003,12 +3024,45 @@ const allSectionsFilled = computed(() => {
   )
 })
 
-const pendingHospitalRecordCount = computed(() =>
-  hospitalRecords.value.filter(item => factStatus(item) !== 'confirmed').length
+const activeUnifiedFacts = computed(() =>
+  (unifiedFacts.value || []).filter(item => item.review_status !== 'excluded' && item.importance !== 'excluded')
 )
 
-const pendingImagingReportCount = computed(() =>
-  imagingReports.value.filter(item => factStatus(item) !== 'confirmed').length
+const hospitalUnifiedFacts = computed(() =>
+  activeUnifiedFacts.value.filter(item => ['hospital_record', 'medical_event'].includes(item.fact_type))
+)
+
+const imagingUnifiedFacts = computed(() =>
+  activeUnifiedFacts.value.filter(item => item.fact_type === 'imaging_report')
+)
+
+const pendingHospitalFactCount = computed(() =>
+  hospitalUnifiedFacts.value.filter(item => !['confirmed', 'system_verified'].includes(item.review_status)).length
+)
+
+const pendingImagingFactCount = computed(() =>
+  imagingUnifiedFacts.value.filter(item => !['confirmed', 'system_verified'].includes(item.review_status)).length
+)
+
+const systemVerifiedHospitalFactCount = computed(() =>
+  hospitalUnifiedFacts.value.filter(item => item.review_status === 'system_verified').length
+)
+
+const systemVerifiedImagingFactCount = computed(() =>
+  imagingUnifiedFacts.value.filter(item => item.review_status === 'system_verified').length
+)
+
+const hospitalFactDetail = computed(() => {
+  const summaryCount = hospitalUnifiedFacts.value.filter(item => item.fact_type === 'hospital_record').length
+  const eventCount = hospitalUnifiedFacts.value.filter(item => item.fact_type === 'medical_event').length
+  if (!hospitalUnifiedFacts.value.length) return '暂无病历事实'
+  return `${hospitalUnifiedFacts.value.length} 条（病历摘要 ${summaryCount} 条、病历事件 ${eventCount} 条），系统预采信 ${systemVerifiedHospitalFactCount.value} 条，${pendingHospitalFactCount.value} 条需人工核验`
+})
+
+const imagingFactDetail = computed(() =>
+  imagingUnifiedFacts.value.length
+    ? `${imagingUnifiedFacts.value.length} 条，系统预采信 ${systemVerifiedImagingFactCount.value} 条，${pendingImagingFactCount.value} 条需人工核验`
+    : '暂无检查事实'
 )
 
 const reportGenerationChecks = computed(() => [
@@ -3019,28 +3073,18 @@ const reportGenerationChecks = computed(() => [
   },
   {
     label: '病历事实',
-    ok: hospitalRecords.value.length > 0 && pendingHospitalRecordCount.value === 0,
-    detail: hospitalRecords.value.length
-      ? `${hospitalRecords.value.length} 条，${pendingHospitalRecordCount.value} 条待确认`
-      : '暂无病历事实',
+    ok: hospitalUnifiedFacts.value.length > 0 && pendingHospitalFactCount.value === 0,
+    detail: hospitalFactDetail.value,
   },
   {
     label: '检查事实',
-    ok: imagingReports.value.length === 0 || pendingImagingReportCount.value === 0,
-    detail: imagingReports.value.length
-      ? `${imagingReports.value.length} 条，${pendingImagingReportCount.value} 条待确认`
-      : '暂无检查事实',
+    ok: imagingUnifiedFacts.value.length > 0 && pendingImagingFactCount.value === 0,
+    detail: imagingFactDetail.value,
   },
   {
     label: '报告正文',
     ok: allSectionsFilled.value,
     detail: '基本案情、资料摘要、鉴定过程、分析说明、鉴定意见',
-  },
-  {
-    label: '规范依据',
-    ok: standardReferences.value.length > 0,
-    detail: standardReferences.value.length ? `已匹配 ${standardReferences.value.length} 条` : '暂未匹配，可先生成但需人工核对',
-    soft: true,
   },
 ])
 
@@ -3167,6 +3211,7 @@ async function loadCase() {
     await loadMaterialsGrouped()
     // 加载 PDF 转换页面
     await loadPdfPages()
+    await loadUnifiedFacts(true)
     await loadCaseStandardReferences(true)
     await loadAnalysisHarness(true)
   } catch (e) {
@@ -3186,6 +3231,71 @@ async function loadMaterialsGrouped() {
       grouped[m.material_type].push(m)
     })
     materialsByType.value = grouped
+  }
+}
+
+async function loadUnifiedFacts(silent = false) {
+  try {
+    loadingUnifiedFacts.value = true
+    const result = await api.getUnifiedFacts(caseId)
+    unifiedFacts.value = result.facts || []
+    unifiedFactCounts.value = result.counts || {}
+    if (!silent && !unifiedFacts.value.length) {
+      ElMessage.info('暂无统一事实，请先建立病历事实卡或检查事实卡')
+    }
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('加载事实库失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+    }
+  } finally {
+    loadingUnifiedFacts.value = false
+  }
+}
+
+async function syncFactLibrary(silent = false) {
+  try {
+    syncingFacts.value = true
+    const result = await api.syncUnifiedFacts(caseId)
+    unifiedFacts.value = result.facts || []
+    unifiedFactCounts.value = result.counts || {}
+    if (!silent) {
+      ElMessage.success(`事实库已刷新：${result.synced_count || 0} 条`)
+    }
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error('刷新事实库失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+    }
+  } finally {
+    syncingFacts.value = false
+  }
+}
+
+async function buildFactLibrary() {
+  try {
+    buildingFacts.value = true
+    const result = await api.buildUnifiedFacts(caseId)
+    unifiedFacts.value = result.facts || []
+    unifiedFactCounts.value = result.counts || {}
+    await loadCase()
+    ElMessage.success(result.message || `事实库已建立：${unifiedFactCounts.value.total || 0} 条`)
+  } catch (e) {
+    ElMessage.error('建立事实库失败：' + (e.response?.data?.detail || e.message || '未知错误'))
+  } finally {
+    buildingFacts.value = false
+  }
+}
+
+async function updateUnifiedFact(row, data) {
+  try {
+    const result = await api.updateUnifiedFact(row.id, data)
+    const idx = unifiedFacts.value.findIndex(item => item.id === row.id)
+    if (idx >= 0) {
+      unifiedFacts.value[idx] = result
+    }
+    await loadUnifiedFacts(true)
+    ElMessage.success('事实状态已更新')
+  } catch (e) {
+    ElMessage.error('更新事实失败：' + (e.response?.data?.detail || e.message || '未知错误'))
   }
 }
 
@@ -3413,6 +3523,7 @@ async function handleExtractAll() {
     const result = await api.extractAll(caseId)
     ElMessage.success('智能提取完成，请检查各板块内容')
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) {
     ElMessage.error('智能提取失败：' + (e.response?.data?.detail || '未知错误'))
   } finally {
@@ -3451,8 +3562,7 @@ async function handleExtractCaseFacts() {
   }
 }
 
-// 资料摘要：从病历提取住院记录
-// 病历按医院分组提取
+// 病历事实卡：按医院分组补提，事实库主按钮会调用同一套后端逻辑
 const medicalGroupList = ref([])  // 医院分组列表
 const loadingMedicalGroups = ref(false)
 const extractingAllGroups = ref(false)
@@ -3492,6 +3602,7 @@ async function handleExtractOneGroup(g) {
       medicalGroupList.value[idx].has_record = true
       medicalGroupList.value[idx].record_id = result.record_id
       await loadCase()
+      await syncFactLibrary(true)
     } else {
       ElMessage.error(`${g.group_name} 提取失败：${result.error || '未知错误'}`)
     }
@@ -3529,6 +3640,7 @@ async function handleExtractAllGroups() {
   }
 
   await loadCase()
+  await syncFactLibrary(true)
   extractingAllGroups.value = false
   ElMessage.success(`病历提取完成，成功 ${successCount}/${groups.length} 家医院`)
 }
@@ -3540,6 +3652,7 @@ async function handleExtractMedicalRecords() {
     const result = await api.extractMedicalRecords(caseId)
     ElMessage.success(result.message || '病历提取完成')
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) {
     ElMessage.error('病历提取失败：' + (e.response?.data?.detail || '未知错误'))
   } finally {
@@ -3590,46 +3703,6 @@ async function generateAppraisalProcess() {
   }
 }
 
-// 一键生成完整报告：鉴定过程 → 分析说明 → 鉴定意见
-async function generateFullReport() {
-  try {
-    generatingFullReport.value = true
-    // 先保存法医检查信息
-    await api.updateCase(caseId, {
-      examination_date: caseData.value.examination_date,
-      clinical_examination: caseData.value.clinical_examination,
-    })
-    const result = await api.generateFullReport(caseId)
-    if (result.sections) {
-      // 刷新报告数据
-      await loadCase()
-      // 汇总提示
-      const sections = result.sections
-      const statusMsgs = []
-      for (const [key, val] of Object.entries(sections)) {
-        const labels = { appraisal_process: '鉴定过程', analysis: '分析说明', opinion: '鉴定意见' }
-        const label = labels[key] || key
-        if (val.status === 'ok') {
-          statusMsgs.push(`${label} 生成成功（${val.method || 'llm'}，${val.length}字）`)
-        } else if (val.status === 'skipped') {
-          statusMsgs.push(`${label} 跳过（${val.error}）`)
-        } else {
-          statusMsgs.push(`${label} 失败（${val.error}）`)
-        }
-      }
-      ElMessage.success('完整报告生成完成')
-      // 逐节提示
-      setTimeout(() => {
-        statusMsgs.forEach(m => ElMessage.info(m))
-      }, 300)
-    }
-  } catch (e) {
-    ElMessage.error('报告生成失败：' + (e.response?.data?.detail || '未知错误'))
-  } finally {
-    generatingFullReport.value = false
-  }
-}
-
 // 鉴定过程：智能提取检查报告（只提取数据到表格，不自动生成鉴定过程）
 async function handleExtractImagingReports() {
   try {
@@ -3637,6 +3710,7 @@ async function handleExtractImagingReports() {
     const result = await api.extractImagingReports(caseId)
     ElMessage.success(result.message || '检查报告提取完成')
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) {
     ElMessage.error('检查报告提取失败：' + (e.response?.data?.detail || '未知错误'))
   } finally {
@@ -3792,9 +3866,9 @@ async function loadAnalysisHarness(silent = false) {
   try {
     loadingAnalysisHarness.value = true
     const result = await api.getAnalysisCandidates(caseId)
-    analysisCandidates.value = result.candidates || []
+    analysisCandidates.value = visibleAnalysisCandidates(result.candidates)
     analysisCandidateWarnings.value = result.warnings || []
-    if (result.standard_references?.length) {
+    if ('standard_references' in result) {
       standardReferences.value = result.standard_references
     }
     if (!silent && !analysisCandidates.value.length) {
@@ -3813,9 +3887,9 @@ async function refreshAnalysisCandidates(silent = false) {
   try {
     loadingAnalysisHarness.value = true
     const result = await api.refreshAnalysisCandidates(caseId)
-    analysisCandidates.value = result.candidates || []
+    analysisCandidates.value = visibleAnalysisCandidates(result.candidates)
     analysisCandidateWarnings.value = result.warnings || []
-    if (result.standard_references?.length) {
+    if ('standard_references' in result) {
       standardReferences.value = result.standard_references
     }
     if (!silent) {
@@ -3839,7 +3913,11 @@ async function updateAnalysisCandidateStatus(candidate, status) {
     const result = await api.updateAnalysisCandidate(candidate.candidate_db_id, { status })
     const idx = analysisCandidates.value.findIndex(item => item.candidate_db_id === candidate.candidate_db_id)
     if (idx >= 0) {
-      analysisCandidates.value[idx] = result
+      if (result.status === 'excluded') {
+        analysisCandidates.value.splice(idx, 1)
+      } else {
+        analysisCandidates.value[idx] = result
+      }
     }
     ElMessage.success(`已标记为${analysisCandidateStatusLabel(status)}`)
   } catch (e) {
@@ -4328,11 +4406,12 @@ function selectSourcePage(page) {
 
 async function viewFactSourcePages(item, kind = '') {
   let pages = sourceMaterialsForFact(item)
-  sourcePagesTitle.value = kind === 'event'
-    ? `事件事实来源页 - ${item.title || medicalEventTypeLabel(item.event_type) || ''}`.trim()
-    : kind === 'imaging'
-    ? `检查事实来源页 - ${item.hospital_name || ''} ${item.exam_type || ''} ${item.exam_part || ''}`.trim()
-    : `病历事实来源页 - ${item.hospital_name || item.source_material_filename || ''}`.trim()
+  const titleMap = {
+    event: `事件事实来源页 - ${item.title || medicalEventTypeLabel(item.event_type) || ''}`.trim(),
+    imaging: `检查事实来源页 - ${item.hospital_name || ''} ${item.exam_type || ''} ${item.exam_part || ''}`.trim(),
+    unified: `事实来源页 - ${item.title || factTypeLabel(item.fact_type, item.fact_role) || ''}`.trim(),
+  }
+  sourcePagesTitle.value = titleMap[kind] || `病历事实来源页 - ${item.hospital_name || item.source_material_filename || ''}`.trim()
   showSourcePagesDialog.value = true
   loadingSourcePages.value = true
   try {
@@ -4344,6 +4423,9 @@ async function viewFactSourcePages(item, kind = '') {
       if (result.pages?.length) pages = result.pages.map(normalizeSourcePage)
     } else if (item?.id && kind === 'event') {
       const result = await api.getMedicalEventSourcePages(item.id)
+      if (result.pages?.length) pages = result.pages.map(normalizeSourcePage)
+    } else if (item?.id && kind === 'unified') {
+      const result = await api.getUnifiedFactSourcePages(item.id)
       if (result.pages?.length) pages = result.pages.map(normalizeSourcePage)
     }
   } catch (e) {
@@ -4418,21 +4500,68 @@ function factStatus(item) {
 }
 
 function factStatusLabel(item) {
-  const map = {
-    pending: '待核验',
-    confirmed: '已确认',
-    needs_edit: '需修改',
+	  const map = {
+	    pending: '待核验',
+	    system_verified: '系统预采信',
+	    confirmed: '已确认',
+	    needs_edit: '需修改',
+	    excluded: '已排除',
   }
   return map[factStatus(item)] || '待核验'
 }
 
 function factStatusType(item) {
-  const map = {
-    pending: 'warning',
-    confirmed: 'success',
-    needs_edit: 'danger',
+	  const map = {
+	    pending: 'warning',
+	    system_verified: 'primary',
+	    confirmed: 'success',
+	    needs_edit: 'danger',
+	    excluded: 'danger',
   }
   return map[factStatus(item)] || 'warning'
+}
+
+function factImportanceLabel(value) {
+  const map = {
+    core: '核心',
+    supporting: '辅助',
+    excluded: '不采用',
+  }
+  return map[value] || '辅助'
+}
+
+function factImportanceType(value) {
+  const map = {
+    core: 'primary',
+    supporting: 'info',
+    excluded: 'danger',
+  }
+  return map[value] || 'info'
+}
+
+function factTypeLabel(type, role) {
+  const roleMap = {
+    admission: '入院',
+    discharge: '出院',
+    surgery: '手术',
+    progress: '病程',
+    consultation: '会诊',
+    exam: '检查',
+    treatment: '治疗',
+    medication: '用药',
+    diagnosis: '诊断',
+  }
+  const typeMap = {
+    hospital_record: roleMap[role] || '病历摘要',
+    medical_event: roleMap[role] || '病历事件',
+    imaging_report: '检查事实',
+  }
+  return typeMap[type] || '事实'
+}
+
+function unifiedFactSourcePages(row) {
+  const pages = Array.isArray(row?.source_page_numbers) ? row.source_page_numbers : parseJsonArray(row?.source_page_numbers)
+  return pages.filter(item => item !== null && item !== undefined && item !== '').join('、')
 }
 
 function eventQualityFlags(event) {
@@ -4487,6 +4616,7 @@ async function confirmHospitalRecord(record) {
   try {
     await api.updateHospitalRecord(record.id, { review_status: 'confirmed' })
     record.review_status = 'confirmed'
+    await syncFactLibrary(true)
     ElMessage.success('病历事实已确认')
   } catch (e) {
     ElMessage.error('确认失败')
@@ -4497,6 +4627,7 @@ async function confirmImagingReport(report) {
   try {
     await api.updateImagingReport(report.id, { review_status: 'confirmed' })
     report.review_status = 'confirmed'
+    await syncFactLibrary(true)
     ElMessage.success('检查事实已确认')
   } catch (e) {
     ElMessage.error('确认失败')
@@ -4507,6 +4638,7 @@ async function confirmMedicalEvent(event) {
   try {
     await api.updateMedicalEvent(event.id, { review_status: 'confirmed' })
     event.review_status = 'confirmed'
+    await syncFactLibrary(true)
     ElMessage.success('事件事实已确认')
   } catch (e) {
     ElMessage.error('确认失败')
@@ -4518,6 +4650,7 @@ async function deleteMedicalEvent(event) {
     await ElMessageBox.confirm('确定删除这条事件事实？删除后将不再进入资料摘要。', '提示', { type: 'warning' })
     await api.deleteMedicalEvent(event.id)
     medicalEvents.value = medicalEvents.value.filter(item => item.id !== event.id)
+    await syncFactLibrary(true)
     ElMessage.success('事件事实已删除')
   } catch (e) {
     // 用户取消时不提示。
@@ -4536,6 +4669,7 @@ async function deleteHospitalRecord(record) {
     await api.deleteHospitalRecord(record.id)
     ElMessage.success('删除成功')
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) { /* 取消 */ }
 }
 
@@ -4551,6 +4685,7 @@ async function saveHospitalRecord() {
     showRecordDialog.value = false
     editingRecord.value = {}
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) {
     ElMessage.error('保存失败')
   } finally {
@@ -4578,6 +4713,7 @@ async function deleteImagingReport(record) {
     await api.deleteImagingReport(record.id)
     ElMessage.success('删除成功')
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) { /* 取消 */ }
 }
 
@@ -4593,6 +4729,7 @@ async function saveImagingReport() {
     showImagingDialog.value = false
     editingImaging.value = { exam_type: 'CT', film_count: 1, exam_part: '' }
     await loadCase()
+    await syncFactLibrary(true)
   } catch (e) {
     ElMessage.error('保存失败')
   } finally {
@@ -4665,6 +4802,67 @@ watch(showAddImagingDialog, (val) => {
       line-height: 1.7;
       color: #303133;
       font-size: 13px;
+    }
+  }
+
+  .fact-library-panel {
+    .fact-library-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      background: #f7f8fa;
+      border: 1px solid #ebeef5;
+      border-radius: 6px;
+    }
+
+    .fact-library-hint {
+      margin-left: 8px;
+      color: #909399;
+      font-size: 12px;
+    }
+
+    .fact-library-counts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .unified-fact-title {
+      font-weight: 600;
+      color: #303133;
+      line-height: 1.5;
+    }
+
+    .unified-fact-hospital {
+      margin-left: 8px;
+      color: #909399;
+      font-weight: 400;
+      font-size: 12px;
+    }
+
+    .unified-fact-summary {
+      margin-top: 4px;
+      color: #606266;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+
+    .unified-fact-source {
+      margin-top: 4px;
+      color: #909399;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+
+    .unified-fact-pages {
+      color: #606266;
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: break-all;
     }
   }
 

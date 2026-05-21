@@ -29,11 +29,21 @@ from app.utils.standards import (
 )
 from app.utils.analysis_harness import (
     build_analysis_harness_payload,
+    collect_candidate_standard_references,
     format_analysis_harness_for_prompt,
     list_saved_analysis_candidates,
+    repair_analysis_text,
     sync_analysis_candidates,
     update_saved_analysis_candidate,
     validate_analysis_text,
+)
+from app.utils.fact_library import (
+    accepted_facts_for_generation,
+    format_facts_for_generation,
+)
+from app.utils.analysis_text_guard import (
+    analysis_output_has_work_trace,
+    build_analysis_fallback_from_harness,
 )
 
 logger = logging.getLogger(__name__)
@@ -574,6 +584,7 @@ def extract_medical_group(case_id: int, group_id: int, db: Session = Depends(get
         value = fields.get(json_key)
         if value is not None and value != "" and value != "null":
             setattr(record, db_key, value)
+    record.hospital_name = group.group_name
 
     # 住院天数
     if fields.get("hospital_days") is not None:
@@ -697,6 +708,7 @@ def extract_medical_records_api(case_id: int, db: Session = Depends(get_db)):
             value = fields.get(json_key)
             if value is not None and value != "" and value != "null":
                 setattr(record, db_key, value)
+        record.hospital_name = group.group_name
 
         if fields.get("hospital_days") is not None:
             try:
@@ -714,17 +726,6 @@ def extract_medical_records_api(case_id: int, db: Session = Depends(get_db)):
             "hospital_name": record.hospital_name,
         })
 
-    # 生成资料摘要
-    summary_result = _generate_material_summary(case_id, db)
-    if summary_result.get("success"):
-        report = db.query(Report).filter(Report.case_id == case_id).first()
-        if not report:
-            report = Report(case_id=case_id)
-            db.add(report)
-            db.flush()
-        _write_report_field(report, "material_summary", summary_result["material_summary"])
-        db.commit()
-
     # 更新材料清单
     _generate_material_list(case_id, case, db)
 
@@ -736,7 +737,7 @@ def extract_medical_records_api(case_id: int, db: Session = Depends(get_db)):
     return {
         "message": f"病历提取完成，成功 {success_count}/{len(results)} 家医院",
         "results": results,
-        "material_summary": summary_result.get("material_summary", ""),
+        "material_summary": "",
         "hospital_records": [
             {
                 "id": r.id,
@@ -823,17 +824,15 @@ def extract_imaging_reports_api(case_id: int, db: Session = Depends(get_db)):
 def generate_material_summary_api(case_id: int, db: Session = Depends(get_db)):
     """
     独立生成「资料摘要」：
-    - 从已提取的住院记录调用LLM生成资料摘要
-    - 与病历提取分离，可单独执行
+    - 从事实库中已建立/核验的病历事实生成资料摘要
+    - 不反向建立或刷新事实库
     """
     case = db.query(Case).filter(Case.id == case_id).first()
     if not case:
         raise HTTPException(status_code=404, detail="案件不存在")
 
-    # 检查是否有住院记录
-    records = db.query(HospitalRecord).filter(HospitalRecord.case_id == case_id).all()
-    if not records:
-        raise HTTPException(status_code=400, detail="请先提取病历（住院记录为空）")
+    if not accepted_facts_for_generation(case_id, db, {"hospital_record", "medical_event"}):
+        raise HTTPException(status_code=400, detail="请先在事实库中建立并核验病历事实")
 
     # 生成资料摘要
     summary_result = _generate_material_summary(case_id, db)
@@ -853,6 +852,7 @@ def generate_material_summary_api(case_id: int, db: Session = Depends(get_db)):
             "message": msg,
             "material_summary": summary_result["material_summary"],
             "model": summary_result.get("model", ""),
+            "method": summary_result.get("method", ""),
         }
     else:
         raise HTTPException(status_code=400, detail=summary_result.get("error", "生成失败"))
@@ -862,7 +862,7 @@ def generate_material_summary_api(case_id: int, db: Session = Depends(get_db)):
 def generate_appraisal_process_api(case_id: int, db: Session = Depends(get_db)):
     """
     独立生成「鉴定过程」：
-    - 使用 LLM 根据法医临床检查和影像学报告生成规范格式文本
+    - 使用 LLM 根据法医临床检查和事实库检查事实生成规范格式文本
     - 包含套话、法医检查信息、影像复阅等内容
     """
     case = db.query(Case).filter(Case.id == case_id).first()
@@ -963,7 +963,11 @@ def list_analysis_candidates_api(case_id: int, db: Session = Depends(get_db)):
             "warnings": payload.get("warnings", []),
             "standard_references": payload.get("standard_references", []),
         }
-    return {"candidates": candidates, "warnings": [], "standard_references": []}
+    return {
+        "candidates": candidates,
+        "warnings": [],
+        "standard_references": collect_candidate_standard_references(candidates),
+    }
 
 
 @router.post("/cases/{case_id}/analysis-candidates/refresh")
@@ -1138,9 +1142,10 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
             # 合并到已有记录（出院记录补充入院记录）
             record = existing_record
         else:
-            record = HospitalRecord(case_id=case.id, material_id=material.id)
+            record = HospitalRecord(case_id=case.id, material_id=material.id, group_id=material.group_id)
             db.add(record)
             db.flush()
+        record.group_id = material.group_id or record.group_id
 
         # 只更新有值的字段
         field_map = {
@@ -1163,6 +1168,8 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
             value = fields.get(json_key)
             if value is not None and value != "" and value != "null":
                 setattr(record, db_key, value)
+        if material.group and material.group.is_confirmed:
+            record.hospital_name = material.group.group_name
 
         # 住院天数特殊处理
         if fields.get("hospital_days") is not None:
@@ -1185,9 +1192,10 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
         ).first()
 
         if not report:
-            report = ImagingReport(case_id=case.id, material_id=material.id)
+            report = ImagingReport(case_id=case.id, material_id=material.id, group_id=material.group_id)
             db.add(report)
             db.flush()
+        report.group_id = material.group_id or report.group_id
 
         field_map = {
             "report_date": "report_date",
@@ -1202,6 +1210,8 @@ def _extract_and_save(material: Material, case: Case, db) -> dict:
             value = fields.get(json_key)
             if value is not None and value != "" and value != "null":
                 setattr(report, db_key, value)
+        if material.group and material.group.is_confirmed:
+            report.hospital_name = material.group.group_name
 
         # film_count 特殊处理（字符串→整数）
         if fields.get("film_count") is not None:
@@ -1430,49 +1440,153 @@ def _generate_material_list(case_id: int, case: Case, db) -> None:
 
 
 def _generate_material_summary(case_id: int, db) -> dict:
-    """从住院记录生成资料摘要全文（拼接方式，不调用LLM）"""
-    records = db.query(HospitalRecord).filter(HospitalRecord.case_id == case_id).all()
-    if not records:
-        return {"success": False, "error": "没有住院记录"}
+    """从统一事实库生成资料摘要。
 
-    # 中文序号列表
+    先用事实库生成可追溯底稿，再交给 LLM 做文书化整理。LLM 只负责组织语言，
+    不负责发现新事实；如果 LLM 失败或未保留来源页，则回退到底稿。
+    """
+    case = db.query(Case).filter(Case.id == case_id).first()
+    person = db.query(Person).filter(Person.case_id == case_id).first()
+    accepted_facts = accepted_facts_for_generation(case_id, db, {"hospital_record", "medical_event"})
+    if not accepted_facts:
+        return {"success": False, "error": "请先在事实库中建立并核验病历事实"}
+
+    draft_text = _build_material_summary_draft(accepted_facts, db)
+    if not draft_text:
+        return {"success": False, "error": "事实库中没有可用于生成资料摘要的病历事实"}
+
+    refined = _refine_material_summary_with_llm(draft_text, case, person)
+    if refined.get("success"):
+        summary_text = refined["material_summary"]
+        logger.info(
+            "案件 %s 资料摘要由事实库底稿+LLM精修生成，长度: %s 字符，%s 条事实",
+            case_id,
+            len(summary_text),
+            len(accepted_facts),
+        )
+        return {
+            "success": True,
+            "material_summary": summary_text,
+            "method": "unified_fact_library_llm_refine",
+            "model": refined.get("model", ""),
+            "draft": draft_text,
+            "harness": refined.get("harness", {}),
+        }
+
+    logger.warning("案件 %s 资料摘要 LLM 精修失败，回退事实库底稿：%s", case_id, refined.get("error"))
+    return {
+        "success": True,
+        "material_summary": _normalize_material_summary_text(draft_text),
+        "method": "unified_fact_library_draft_fallback",
+        "model": "",
+        "llm_error": refined.get("error", ""),
+    }
+
+
+def _build_material_summary_draft(facts: list, db: Session) -> str:
+    """将已接受事实整理成带来源页的资料摘要底稿。"""
     cn_nums = ["（一）", "（二）", "（三）", "（四）", "（五）", "（六）", "（七）", "（八）", "（九）", "（十）"]
+    grouped = {}
+    for fact in facts:
+        hospital = fact.hospital_name or "相关医院"
+        grouped.setdefault(hospital, []).append(fact)
 
-    # 拼接住院记录信息
-    record_parts = []
-    for idx, r in enumerate(records):
+    parts = []
+    for idx, (hospital, hospital_facts) in enumerate(grouped.items()):
         prefix = cn_nums[idx] if idx < len(cn_nums) else f"（{idx + 1}）"
-        part = f"{prefix}据{r.hospital_name or '某医院'}住院病案（住院号：{r.admission_number or '-'})记载："
-        if r.admission_date:
-            part += f"患者{r.admission_date}入院，"
-        if r.discharge_date:
-            part += f"{r.discharge_date}出院，"
-        if r.hospital_days:
-            part += f"住院{r.hospital_days}天。"
-        if r.chief_complaint:
-            part += f"主诉：{r.chief_complaint}。"
-        if r.present_illness_history:
-            part += f"现病史：{r.present_illness_history}。"
-        if r.past_history:
-            part += f"既往史：{r.past_history}。"
-        if r.physical_examination:
-            part += f"体格检查：{r.physical_examination}。"
-        if r.admission_diagnosis:
-            part += f"入院诊断：{r.admission_diagnosis}。"
-        if r.treatment_process:
-            part += f"治疗过程：{r.treatment_process}。"
-        if r.medication:
-            part += f"用药情况：{r.medication}。"
-        if r.discharge_diagnosis:
-            part += f"出院诊断：{r.discharge_diagnosis}。"
-        if r.discharge_orders:
-            part += f"出院医嘱：{r.discharge_orders}。"
-        record_parts.append(part)
+        admission_number = _hospital_admission_number(db, hospital_facts)
+        admission_text = f"（住院号：{admission_number}）" if admission_number else ""
+        lines = [f"{prefix}据{hospital}住院病历{admission_text}记载："]
+        for fact in hospital_facts:
+            date = fact.fact_date or "日期未明"
+            title = fact.title or "病历事实"
+            summary = (fact.summary or "").strip()
+            if not summary:
+                continue
+            line = f"{date}，{title}：{summary}"
+            try:
+                pages = json.loads(fact.source_page_numbers or "[]")
+            except (TypeError, json.JSONDecodeError):
+                pages = []
+            if pages:
+                line += f"（来源页：{', '.join(str(p) for p in pages)}）"
+            lines.append(line)
+        if len(lines) > 1:
+            parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
-    summary_text = "\n\n".join(record_parts)
-    logger.info(f"案件 {case_id} 资料摘要拼接完成，长度: {len(summary_text)} 字符，{len(records)} 条记录")
 
-    return {"success": True, "material_summary": summary_text}
+def _hospital_admission_number(db: Session, facts: list) -> str:
+    """从医院事实中找住院号，用于资料摘要真实报告式开头。"""
+    for fact in facts:
+        if fact.fact_type != "hospital_record" or not fact.source_id:
+            continue
+        record = db.query(HospitalRecord).filter(HospitalRecord.id == fact.source_id).first()
+        if record and record.admission_number:
+            return str(record.admission_number).strip()
+    return ""
+
+
+def _refine_material_summary_with_llm(draft_text: str, case: Case | None, person: Person | None) -> dict:
+    """让 LLM 在不新增事实的前提下，把资料摘要底稿整理成正式文书表述。"""
+    person_name = person.name if person else ""
+    extra_context = "\n".join([
+        f"被鉴定人：{person_name}" if person_name else "",
+        f"委托事项：{case.entrustment_matter}" if case and case.entrustment_matter else "",
+        f"案发时间：{case.accident_date}" if case and case.accident_date else "",
+    ]).strip()
+    instructions = """请根据输入的【事实库底稿】撰写司法鉴定意见书的“三、资料摘要”正文。
+
+参考杨豫臻、张金遂两份真实司法鉴定意见书的资料摘要写法：
+1. 以住院病历为单位分段，用“（一）（二）（三）”编号。
+2. 每段开头使用“据××医院住院病历（住院号：××）记载：”；没有住院号时省略住院号括号。
+3. 正文是连续叙事，不写成字段清单，不逐项输出“主诉：”“现病史：”“体格检查：”等标签。
+4. 叙事顺序通常为：入院/出院/住院天数、受伤入院原因、主要病史和查体、诊断、重要治疗经过或手术、出院情况及出院医嘱。
+5. 保留原始诊断名称、日期、住院号、手术名称、关键检查发现；删除明显重复和无鉴定意义的套话。
+
+工作要求：
+1. 只能使用事实库底稿中的事实、日期、医院名称、诊断、治疗经过和来源页，不得新增任何底稿外事实。
+2. 保留医院分段结构，每家医院以“（一）据××医院住院病历（住院号：××）记载：”开头。
+3. 按时间顺序组织内容，合并同一来源、同一住院过程中的重复表述。
+4. 重点保留与委托事项直接相关的入院情况、伤情诊断、重要手术/治疗、出院诊断和出院医嘱。
+5. 病程记录、会诊、检验等辅助事实只在与委托事项有关时简要保留。
+6. 来源页只作为内部核验依据，最终正文不要输出“来源页”字样或页码括号。
+7. 输出纯文本正文，不要输出标题、解释、JSON、Markdown 表格或思考过程。"""
+    result = call_llm_text_harness(
+        task_name="generate_material_summary_from_fact_library",
+        system_prompt="你是法医临床司法鉴定意见书撰写助手，必须严格依据已核验事实生成资料摘要。",
+        instructions=instructions,
+        input_text=draft_text,
+        extra_context=extra_context,
+        temperature=0.1,
+        max_tokens=5000,
+        max_input_chars=18000,
+        max_retries=1,
+    )
+    if not result.get("success"):
+        return result
+
+    content = _normalize_material_summary_text((result.get("content") or "").strip())
+    if not re.search(r"据.+?(病历|住院|医院).*记载", content):
+        return {"success": False, "error": "LLM 输出未保留资料摘要分段格式，已拒绝采用"}
+    return {
+        "success": True,
+        "material_summary": content,
+        "model": result.get("model", ""),
+        "harness": result.get("harness", {}),
+    }
+
+
+def _normalize_material_summary_text(text: str) -> str:
+    """稳定资料摘要成文格式，避免模型省略真实报告常用段号。"""
+    if not text:
+        return ""
+    text = text.replace("住院病案", "住院病历")
+    text = re.sub(r"（\s*来源页\s*[:：][^）]*）", "", text)
+    text = re.sub(r"\(\s*来源页\s*[:：][^)]*\)", "", text)
+    if re.match(r"^据.+?住院病历", text):
+        text = f"（一）{text}"
+    return text
 
 
 def _generate_imaging_review(imaging_data: list[dict], person_name: str,
@@ -1545,10 +1659,8 @@ def _generate_imaging_review(imaging_data: list[dict], person_name: str,
 def _generate_appraisal_process(case_id: int, db) -> dict:
     """生成鉴定过程：临床检查医生写了直接用，没写LLM根据最新影像推断；
     影像复阅一次LLM调用，根据委托事项+资料摘要从检查事实中选相关条目并写法医风格。"""
-    img_reports = db.query(ImagingReport).filter(ImagingReport.case_id == case_id).all()
     case = db.query(Case).filter(Case.id == case_id).first()
     person = db.query(Person).filter(Person.case_id == case_id).first()
-    records = db.query(HospitalRecord).filter(HospitalRecord.case_id == case_id).all()
 
     if not case:
         return {"success": False, "error": "案件不存在"}
@@ -1559,46 +1671,24 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
     accident_date = case.accident_date or ""
     entrustment = case.entrustment_matter or ""
 
+    medical_facts = accepted_facts_for_generation(case_id, db, {"hospital_record", "medical_event"})
+    imaging_facts = accepted_facts_for_generation(case_id, db, {"imaging_report"})
+    if not medical_facts and not imaging_facts:
+        return {"success": False, "error": "请先在事实库中建立并核验病历事实或检查事实"}
+
     # 资料摘要缩编（出院诊断 + 关键手术经过，600字以内）
-    summary_parts = []
-    for r in records:
-        if r.discharge_diagnosis:
-            summary_parts.append(f"【{r.hospital_name or ''}出院诊断】{r.discharge_diagnosis[:200]}")
-        if r.treatment_process and any(kw in (r.treatment_process or "") for kw in
-                                       ("手术", "探查", "切除", "修补", "置换", "内固定")):
-            summary_parts.append(f"【{r.hospital_name or ''}手术经过】{(r.treatment_process or '')[:300]}")
-    summary_context = "\n".join(summary_parts)[:600]
+    summary_context = format_facts_for_generation(medical_facts, max_chars=1200)[:900] if medical_facts else ""
 
     # 构建影像数据（粗筛去血管超声/肌电/鼻咽喉镜/未完成审核/纯正常）
-    _SKIP_TYPES = {"emg_report", "nasopharyngoscopy", "hearing_test", "eeg", "nerve_conduction"}
-    _VASCULAR_KW = ("静脉", "动脉", "动静脉", "血栓", "深静脉", "肌间静脉", "腓静脉")
-    _POSITIVE_KW = ("骨折", "损伤", "出血", "血肿", "断裂", "置换", "术后", "内固定", "缺如", "缺失")
-    _PENDING_KW = ("未完成审核", "尚未上传", "尚未完成", "待审核", "未审核")
-    _NORMAL_KW = ("未见明显异常", "未见异常", "未见明确")
-
     imaging_data = []
-    for r in img_reports:
-        rtype = (r.exam_type or "").lower().strip()
-        ep = (r.exam_part or "").lower()
-        rc = (r.report_content or "").lower()
-        if rtype in _SKIP_TYPES:
-            continue
-        if any(m in ep for m in _VASCULAR_KW) or any(m in rc[:120] for m in _VASCULAR_KW):
-            continue
-        if any(m in rtype for m in ("超声", "彩超", "ultrasound")) and \
-           not any(m in ep for m in ("肝", "胆", "脾", "胰", "肾", "腹", "心脏", "心")):
-            continue
-        if any(m in rc for m in _PENDING_KW) and not any(m in rc for m in _POSITIVE_KW):
-            continue
-        if any(m in rc for m in _NORMAL_KW) and not any(m in rc for m in _POSITIVE_KW):
-            continue
+    for fact in imaging_facts:
         imaging_data.append({
-            "报告日期": r.report_date or "",
-            "医院名称": r.hospital_name or "",
-            "检查类型": r.exam_type or "",
-            "检查部位": r.exam_part or "",
-            "片子编号": r.film_number or "",
-            "报告内容": r.report_content or "",
+            "报告日期": fact.fact_date or "",
+            "医院名称": fact.hospital_name or "",
+            "检查类型": "",
+            "检查部位": fact.title or "",
+            "片子编号": "",
+            "报告内容": fact.summary or fact.source_quote or "",
         })
 
     # 伤后时间
@@ -1683,7 +1773,7 @@ def _generate_appraisal_process(case_id: int, db) -> dict:
         parts.append(imaging_review)
     process_text = "\n\n".join(parts)
 
-    logger.info(f"案件 {case_id} 鉴定过程生成成功（影像 {len(img_reports)}→{len(imaging_data)} 条）")
+    logger.info(f"案件 {case_id} 鉴定过程生成成功（事实库检查事实 {len(imaging_facts)}→{len(imaging_data)} 条）")
     return {"success": True, "appraisal_process": process_text, "method": "llm"}
 
 
@@ -1995,7 +2085,9 @@ def _generate_analysis(case_id: int, db) -> dict:
 - 三期分析固定句式："因此，根据其损伤情况，结合其年龄、自身情况、临床治疗经过、目前恢复情况，参照...有关规定，其...拟定为X日"
 - 三期天数必须落在护栏或规范依据列出的范围内；多发损伤只能综合考虑，不能简单相加
 - 只有委托事项包含后续治疗费/治疗费时才分析费用，金额需同时写大写和小写
-- 不要输出ICD编码、Markdown项目符号、思考过程或解释说明
+- 不得复述【分析说明护栏】、候选清单、status、decision、风险提示、输入数据或规范列表
+- 不得输出"被鉴定人信息"、"委托单位"等资料整理清单，不要写"根据任务要求""让我先整理"等工作过程
+- 不要输出ICD编码、Markdown项目符号、Markdown加粗、思考过程或解释说明
 - 只输出分析说明正文，不要标题"""
 
     user_prompt = f"""【被鉴定人】{person_name}
@@ -2026,7 +2118,14 @@ def _generate_analysis(case_id: int, db) -> dict:
 
     if llm_result.get("success"):
         analysis_text = _clean_generated_report_text(llm_result["content"])
+        analysis_text = repair_analysis_text(analysis_text, harness_payload)
         analysis_text, warnings = _remove_uncommissioned_analysis(analysis_text, entrustment)
+        if analysis_output_has_work_trace(analysis_text):
+            logger.warning("案件 %s 分析说明 LLM 输出含工作痕迹，改用护栏保守生成。", case_id)
+            analysis_text = build_analysis_fallback_from_harness(case, person_name, records, harness_payload, entrustment)
+            analysis_text, fallback_warnings = _remove_uncommissioned_analysis(analysis_text, entrustment)
+            warnings.extend(fallback_warnings)
+            warnings.append("LLM 输出含候选清单或工作痕迹，已改用已采信事实生成保守版分析说明。")
         warnings.extend(validate_analysis_text(analysis_text, harness_payload))
         warnings.extend(harness_payload.get("warnings", []))
         warnings = list(dict.fromkeys(warnings))

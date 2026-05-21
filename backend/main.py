@@ -59,7 +59,7 @@ logger.info("=" * 50)
 # ==================== FastAPI 应用 ====================
 
 from app.database import init_db
-from app.routers import cases, materials, medical_records, medical_events, imaging_reports, reports, style_logs, persons, llm_extract, settings, standards
+from app.routers import cases, materials, medical_records, medical_events, imaging_reports, reports, style_logs, persons, llm_extract, settings, standards, fact_library
 
 app = FastAPI(
     title="司法鉴定意见书自动生成系统",
@@ -88,6 +88,7 @@ app.include_router(persons.router)
 app.include_router(llm_extract.router)
 app.include_router(settings.router)
 app.include_router(standards.router)
+app.include_router(fact_library.router)
 
 
 @app.on_event("startup")
