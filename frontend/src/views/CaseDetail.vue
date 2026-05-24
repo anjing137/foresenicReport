@@ -281,13 +281,16 @@
                       </div>
                       <div class="thumb-info">
                         <span class="thumb-filename" :title="page.filename">{{ page.filename }}</span>
-                        <div v-if="page.analysis?.prediction?.material_type_label" class="thumb-prediction">
-                          <el-tag size="small" :type="predictionTagType(page.analysis.prediction.confidence)" effect="plain">
-                            {{ page.analysis.prediction.material_type_label }}
+                        <div v-if="pageDisplayClassification(page)" class="thumb-prediction">
+                          <el-tag size="small" :type="page.imported ? 'success' : predictionTagType(page.analysis?.prediction?.confidence)" effect="plain">
+                            {{ pageDisplayClassification(page).typeLabel }}
                           </el-tag>
-                          <el-tag v-if="page.analysis.prediction.material_subtype_label" size="small" type="info" effect="plain">
-                            {{ page.analysis.prediction.material_subtype_label }}
+                          <el-tag v-if="pageDisplayClassification(page).subtypeLabel" size="small" type="info" effect="plain">
+                            {{ pageDisplayClassification(page).subtypeLabel }}
                           </el-tag>
+                          <span v-if="pageDisplayClassification(page).groupName" class="classification-group-name">
+                            {{ pageDisplayClassification(page).groupName }}
+                          </span>
                         </div>
                       </div>
                       <div class="thumb-actions">
@@ -1748,18 +1751,21 @@
       </div>
       <el-empty v-else description="无图片" />
 
-      <div v-if="viewingPdfPage?.analysis?.prediction?.material_type_label" class="pdf-prediction-panel">
-        <el-tag size="small" :type="predictionTagType(viewingPdfPage.analysis.prediction.confidence)" effect="plain">
-          {{ viewingPdfPage.analysis.prediction.material_type_label }}
-        </el-tag>
-        <el-tag v-if="viewingPdfPage.analysis.prediction.material_subtype_label" size="small" type="info" effect="plain">
-          {{ viewingPdfPage.analysis.prediction.material_subtype_label }}
-        </el-tag>
-        <span v-if="viewingPdfPage.analysis.prediction.group_name">
-          {{ viewingPdfPage.analysis.prediction.group_name }}
+      <div v-if="pageDisplayClassification(viewingPdfPage)" class="pdf-prediction-panel">
+        <span class="classification-source">
+          {{ viewingPdfPage?.imported ? '当前归类' : '预分类' }}
         </span>
-        <span class="prediction-reason">
-          {{ viewingPdfPage.analysis.prediction.reason }}
+        <el-tag size="small" :type="viewingPdfPage?.imported ? 'success' : predictionTagType(viewingPdfPage?.analysis?.prediction?.confidence)" effect="plain">
+          {{ pageDisplayClassification(viewingPdfPage).typeLabel }}
+        </el-tag>
+        <el-tag v-if="pageDisplayClassification(viewingPdfPage).subtypeLabel" size="small" type="info" effect="plain">
+          {{ pageDisplayClassification(viewingPdfPage).subtypeLabel }}
+        </el-tag>
+        <span v-if="pageDisplayClassification(viewingPdfPage).groupName">
+          {{ pageDisplayClassification(viewingPdfPage).groupName }}
+        </span>
+        <span v-if="!viewingPdfPage?.imported" class="prediction-reason">
+          {{ viewingPdfPage?.analysis?.prediction?.reason }}
         </span>
       </div>
 
@@ -1809,6 +1815,15 @@
         </div>
         <div v-else-if="viewingPdfPage?.imported" class="imported-status">
           <el-tag type="success" size="small">已导入到: {{ viewingPdfPage.material_type_label || viewingPdfPage.material_type }}</el-tag>
+          <el-button
+            link
+            type="primary"
+            size="small"
+            @click="openMoveViewingPdfPage"
+            :disabled="isCompleted || !viewingPdfPage.material_id"
+          >
+            转移到其他类别
+          </el-button>
           <el-button link type="warning" size="small" @click="revertViewingPdfPage" :loading="revertingPdfPage">
             撤销导入
           </el-button>
@@ -2984,6 +2999,30 @@ function getGroupsForType(type) {
   return materialsByType.value[type]
     .filter(g => g.group)
     .map(g => g.group)
+}
+
+function getGroupNameById(type, groupId) {
+  if (!type || !groupId) return ''
+  const group = getGroupsForType(type).find(g => g.id === groupId)
+  return group?.group_name || ''
+}
+
+function pageDisplayClassification(page) {
+  if (!page) return null
+  if (page.imported) {
+    return {
+      typeLabel: page.material_type_label || getTypeLabel(page.material_type),
+      subtypeLabel: page.material_subtype_label || '',
+      groupName: page.group_name || getGroupNameById(page.material_type, page.group_id),
+    }
+  }
+  const prediction = page.analysis?.prediction
+  if (!prediction?.material_type_label) return null
+  return {
+    typeLabel: prediction.material_type_label,
+    subtypeLabel: prediction.material_subtype_label || '',
+    groupName: prediction.group_name || '',
+  }
 }
 
 // 对话框
@@ -4228,6 +4267,21 @@ function openMoveMaterialDialog(mat) {
   })
 }
 
+function openMoveViewingPdfPage() {
+  const page = viewingPdfPage.value
+  if (!page?.material_id) {
+    ElMessage.warning('未找到该图片对应的材料记录')
+    return
+  }
+  openMoveMaterialDialog({
+    id: page.material_id,
+    material_type: page.material_type,
+    group_id: page.group_id || null,
+    description: page.description || page.filename,
+    original_filename: page.filename,
+  })
+}
+
 async function confirmMoveMaterial() {
   if (!movingMaterial.value) return
   if (!moveTargetType.value) {
@@ -4241,6 +4295,7 @@ async function confirmMoveMaterial() {
   }
 
   movingMaterialSaving.value = true
+  const viewingFilename = viewingPdfPage.value?.filename || ''
   try {
     await api.moveMaterial(movingMaterial.value.id, {
       material_type: moveTargetType.value,
@@ -4250,6 +4305,12 @@ async function confirmMoveMaterial() {
     ElMessage.success('材料已转移')
     showMoveMaterialDialog.value = false
     await loadCase()
+    if (showPdfImageDialog.value && viewingFilename) {
+      const found = findPdfAndPage(viewingFilename)
+      if (found) {
+        viewingPdfPage.value = found.page
+      }
+    }
   } catch (e) {
     ElMessage.error('转移失败：' + (e.response?.data?.detail || e.message || '未知错误'))
   } finally {
